@@ -1,0 +1,5 @@
+open minifroge prompt
+cd local file
+enter
+
+conda run -p ".\conda_env" python .\scripts\benchmark_data_processing.py --maccor "Q:\Data\ASCIIfiles\MACCOR #100\MACCOR #100_PYA_HIMS_Li_40C_BE_1.097"
