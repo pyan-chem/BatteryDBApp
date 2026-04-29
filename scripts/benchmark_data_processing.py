@@ -18,9 +18,9 @@ from analysis.data_processor import DataProcessor
 
 
 DEFAULT_FILES = {
-    "Biologic": Path(r"R:/HIMS-MMC-MPG/PYA/SAFELOOP/PYA_CC_Gr_NMC83_MDFA1_4_D1_C01.mpr"),
+    "Biologic": Path(r"xxx.mpr"),
     "Arbin": None,
-    "Maccor": Path(r"Q:/Data/ASCIIfiles/MACCOR #100/MACCOR #100_PYA_HIMS_Li_40C_BE_1.097"),
+    "Maccor": Path(r"xxx.xyz"),
 }
 
 PROCESSOR_MAP = {
