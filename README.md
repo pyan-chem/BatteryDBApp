@@ -59,8 +59,8 @@ BatteryDBApp/
 
 1. **Create virtual environment**:
    ```bash
-   python -m venv .venv
-   .venv\Scripts\activate      # Windows
+   conda create -n BatteryDBApp python=3.11
+   conda activate BatteryDBApp
 
 2. **Install dependencies**:
    ```bash
