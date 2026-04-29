@@ -13,11 +13,11 @@ A desktop application for processing, analyzing, and visualizing electrochemical
 - Data cleaning and processing
 - Visualization and analysis
   - Overvoltage (charge mean voltage – discharge mean voltage)
-  - Accumulated discharge energy
+  - Accumulated discharge energy (not validated yet)
   - dQ/dV
   - dV/dQ
   - Cycle-to-cycle endpointslippage
-  - 
+
 ### Database
 - SQLite3 backend (`battery_data.db`)
 - Cell metadata storage (electrode materials, active masses, test parameters)
