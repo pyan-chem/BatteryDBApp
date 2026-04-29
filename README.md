@@ -71,3 +71,6 @@ BatteryDBApp/
 
 ```bash
 python BatteryDBApp/main.py
+
+<img width="1674" height="826" alt="image" src="https://github.com/user-attachments/assets/ac4455fd-3651-4d30-bfff-18e61126f2fd" />
+
