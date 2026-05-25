@@ -49,11 +49,34 @@ class DataImporter:
 
     @staticmethod
     def _read_biologic(file_path):
-        """Read Biologic .mpr files using galvani library."""
+        """Read Biologic .mpr files using yadg first, then fallback to galvani."""
+        required_columns = [
+            'time/s',
+            'Ewe/V',
+            'I/mA',
+            'half cycle',
+            '(Q-Qo)/mA.h',
+            '|Energy|/W.h',
+            'Q charge/discharge/mA.h',
+        ]
+
+        logger.info(f"Reading Biologic file with yadg: {file_path}")
+        try:
+            yadg_df = DataImporter._read_biologic_yadg(file_path)
+            missing = [col for col in required_columns if col not in yadg_df.columns]
+            if not missing:
+                logger.info(f"yadg Biologic import succeeded: {len(yadg_df)} rows")
+                return yadg_df
+            logger.warning(
+                f"yadg failed, falling back to galvani: missing required columns {missing}"
+            )
+        except Exception as yadg_error:
+            logger.warning(f"yadg failed, falling back to galvani: {yadg_error}")
+
         try:
             from galvani import BioLogic
             
-            logger.info(f"Reading Biologic file: {file_path}")
+            logger.info(f"Reading Biologic file with galvani: {file_path}")
             mpr_file = BioLogic.MPRfile(file_path)
             
             # Convert the data to a DataFrame
@@ -71,6 +94,35 @@ class DataImporter:
         except Exception as e:
             logger.error(f"Error reading Biologic file '{file_path}': {str(e)}")
             raise Exception(f"Error reading Biologic file: {str(e)}")
+
+    @staticmethod
+    def _read_biologic_yadg(file_path):
+        """Read Biologic .mpr files using yadg and map fields to legacy DataProcessor columns."""
+        from yadg.extractors import extract
+
+        tree = extract("eclab.mpr", file_path)
+        dataset = tree.to_dataset()
+
+        # Map yadg variables to the existing Biologic column names consumed by DataProcessor.
+        mapped = pd.DataFrame()
+        variable_mapping = {
+            'time/s': 'time',
+            'Ewe/V': 'Ewe',
+            'I/mA': 'I',
+            'half cycle': 'half cycle',
+            '(Q-Qo)/mA.h': '(Q-Qo)',
+            '|Energy|/W.h': 'Energy we',
+        }
+
+        for target_col, source_var in variable_mapping.items():
+            if source_var in dataset:
+                mapped[target_col] = pd.Series(dataset[source_var].values)
+
+        # yadg reports charge/discharge capacity in coulomb (C); convert to mA.h.
+        if 'Q charge or discharge' in dataset:
+            mapped['Q charge/discharge/mA.h'] = pd.Series(dataset['Q charge or discharge'].values) / 3.6
+
+        return mapped
 
     @staticmethod
     def _read_arbin(file_path):
@@ -250,8 +302,13 @@ class DataImporter:
             
             # Handle Cycle column
             if 'Echem_Cycle' in df.columns:
-                logger.debug("Processing Echem_Cycle column")
-                df['Echem_Cycle'] = pd.to_numeric(df['Echem_Cycle'], errors='coerce').fillna(0).astype(int)
+                logger.debug("Processing Echem_Cycle column (strip thousands separators)")
+                # Some Maccor exports format large cycle numbers with thousands separators
+                # e.g. '1,000'. Remove commas before numeric conversion to preserve values.
+                df['Echem_Cycle'] = pd.to_numeric(
+                    df['Echem_Cycle'].astype(str).str.replace(',', '', regex=False),
+                    errors='coerce'
+                ).fillna(0).astype(int)
             
             # Handle Mode column
             if 'Echem_Mode' in df.columns:

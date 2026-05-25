@@ -149,8 +149,9 @@ class AnalysisWindow(QDialog):
     def parse_cycles(self):
         """Parse cycles input and return list of cycle numbers"""
         if self.all_cycles_chk.isChecked():
-            # Return all unique cycles
-            return sorted(self.processed_data['cycle_number'].unique().tolist())
+            # Return all unique cycles except cycle 0 (pre-cycle/rest block)
+            all_cycles = self.processed_data['cycle_number'].unique().tolist()
+            return sorted([c for c in all_cycles if c != 0])
         
         cycles_text = self.cycles_input.text().strip()
         if not cycles_text:
@@ -353,8 +354,10 @@ class AnalysisWindow(QDialog):
                 if analysis_type == "Voltage vs. Time":
                     for cycle in cycles:
                         cycle_data = data[data['cycle_number'] == cycle]
+                        # Special label for cycle 0 (pre-cycle/rest block)
+                        cycle_label = f'Cycle {cycle} (pre-cycle/rest)' if cycle == 0 else f'Cycle {cycle}'
                         ax.plot(cycle_data['time_h'], cycle_data['voltage_V'], 
-                               label=f'Cycle {cycle}', linewidth=1.5)
+                               label=cycle_label, linewidth=1.5)
                     ax.set_xlabel('Time (h)', fontsize=12)
                     ax.set_ylabel('Voltage (V)', fontsize=12)
                 
@@ -378,8 +381,10 @@ class AnalysisWindow(QDialog):
                 elif analysis_type == "Voltage vs. Capacity cyclic":
                     for cycle in cycles:
                         cycle_data = data[data['cycle_number'] == cycle]
+                        # Special label for cycle 0 (pre-cycle/rest block)
+                        cycle_label = f'Cycle {cycle} (pre-cycle/rest)' if cycle == 0 else f'Cycle {cycle}'
                         ax.plot(cycle_data['(Q-Qo)_mAh_g'], cycle_data['voltage_V'], 
-                               label=f'Cycle {cycle}', linewidth=1.5)
+                               label=cycle_label, linewidth=1.5)
                     ax.set_xlabel('Capacity (Q-Qo) (mAh/g)', fontsize=12)
                     ax.set_ylabel('Voltage (V)', fontsize=12)
                     ax.legend()
@@ -395,12 +400,14 @@ class AnalysisWindow(QDialog):
                     for cycle in cycles:
                         charge_data = data[(data['cycle_number'] == cycle) & (data['type'] == 'charge')]
                         discharge_data = data[(data['cycle_number'] == cycle) & (data['type'] == 'discharge')]
+                        # Special label for cycle 0 (pre-cycle/rest block)
+                        cycle_label = f'Cycle {cycle} (pre-cycle/rest)' if cycle == 0 else f'Cycle {cycle}'
                         if len(charge_data) > 0:
                             ax.plot(charge_data['voltage_V'], charge_data['dQdV_charge'], 'o-', 
-                                   label=f'Cycle {cycle} Charge', linewidth=1.5, alpha=0.7)
+                                   label=f'{cycle_label} Charge', linewidth=1.5, alpha=0.7)
                         if len(discharge_data) > 0:
                             ax.plot(discharge_data['voltage_V'], discharge_data['dQdV_discharge'], 's-', 
-                                   label=f'Cycle {cycle} Discharge', linewidth=1.5, alpha=0.7)
+                                   label=f'{cycle_label} Discharge', linewidth=1.5, alpha=0.7)
                     ax.set_xlabel('Voltage (V)', fontsize=12)
                     ax.set_ylabel('dQ/dV', fontsize=12)
                     ax.legend(fontsize=8)
@@ -408,8 +415,10 @@ class AnalysisWindow(QDialog):
                 elif analysis_type == "dV/dQ":
                     for cycle in cycles:
                         cycle_data = data[data['cycle_number'] == cycle]
+                        # Special label for cycle 0 (pre-cycle/rest block)
+                        cycle_label = f'Cycle {cycle} (pre-cycle/rest)' if cycle == 0 else f'Cycle {cycle}'
                         ax.plot(cycle_data['discharge_cap_mAh_g'], cycle_data['dVdQ'], 
-                               label=f'Cycle {cycle}', linewidth=1.5)
+                               label=cycle_label, linewidth=1.5)
                     ax.set_xlabel('Discharge Capacity (mAh/g)', fontsize=12)
                     ax.set_ylabel('dV/dQ', fontsize=12)
                     ax.legend()

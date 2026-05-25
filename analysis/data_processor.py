@@ -45,8 +45,24 @@ class DataProcessor:
                 logger.warning("Column 'I/mA' not found in Biologic data, using default")
             
             # cycle_number: (half cycle + 1) / 2, rounded up (ceil)
+            # Special handling: initial rest rows (current == 0) should be assigned cycle_number = 0
             if 'half cycle' in df.columns:
-                processed_data['cycle_number'] = np.ceil((df['half cycle'] + 1) / 2.0).astype(int)
+                # Start with standard cycle calculation
+                cycle_numbers = pd.Series(np.ceil((df['half cycle'] + 1) / 2.0), index=df.index)
+                
+                if 'I/mA' in df.columns:
+                    # Detect initial rest block (current == 0 at the start)
+                    current_series = pd.to_numeric(df['I/mA'], errors='coerce').fillna(0.0)
+                    
+                    # Find position of first non-zero current
+                    nonzero_indices = np.where((current_series != 0).values)[0]
+                    if len(nonzero_indices) > 0:
+                        first_nonzero_pos = nonzero_indices[0]
+                        # Assign 0 to all rows before first non-zero current
+                        cycle_numbers.iloc[:first_nonzero_pos] = 0
+                        logger.debug(f"Assigned initial {first_nonzero_pos} rest rows (current==0) to cycle_number=0")
+                
+                processed_data['cycle_number'] = cycle_numbers.astype(int).values
             else:
                 processed_data['cycle_number'] = 1
                 logger.warning("Column 'half cycle' not found in Biologic data, using default")
@@ -423,14 +439,55 @@ class DataProcessor:
                 processed_data['current_mA'] = 0
                 logger.warning("Column 'Echem_Current_A' not found in Maccor data")
             
-            # cycle_number: Echem_Cycle
+            # cycle_number: Echem_Cycle with special handling for initial rest block
+            # Rule: Only the initial contiguous rest block at the beginning becomes cycle_number=0
+            #       Later rest rows after cycling starts stay in their raw Echem_Cycle
             if 'Echem_Cycle' in df.columns:
-                cycle_series = pd.to_numeric(df['Echem_Cycle'], errors='coerce').fillna(0).astype(int)
-                # Maccor data can be zero-based; map first cycle to 1
-                if not cycle_series.empty and cycle_series.min() == 0:
-                    cycle_series = cycle_series + 1
-                    logger.debug("Adjusted Maccor cycle numbering from 0-based to 1-based")
-                processed_data['cycle_number'] = cycle_series
+                cycle_series = pd.to_numeric(df['Echem_Cycle'], errors='coerce')
+                
+                if 'Echem_Mode' in df.columns:
+                    mode_series = df['Echem_Mode'].astype(str).str.strip().str.upper()
+                    
+                    # Find first position where mode is C or D (start of cycling)
+                    cd_mask = mode_series.isin(['C', 'CHARGE', 'D', 'DISCHARGE'])
+                    cd_indices = np.where(cd_mask.values)[0]
+                    
+                    if len(cd_indices) > 0:
+                        first_cd_pos = cd_indices[0]
+                        # Initial rest block: rows before first C/D AND mode == R
+                        initial_rest_mask = (np.arange(len(mode_series)) < first_cd_pos) & mode_series.isin(['R', 'REST'])
+
+                        # For rows after the first C/D, treat raw 0 as missing and forward-fill
+                        fill_series = cycle_series.copy()
+                        after_cd_mask = np.arange(len(fill_series)) >= first_cd_pos
+                        # Replace explicit zeros after first C/D with NaN so ffill can fill from prior cycles
+                        zero_after_cd = after_cd_mask & (fill_series == 0)
+                        if zero_after_cd.any():
+                            fill_series[zero_after_cd] = np.nan
+
+                        # Fill NaN (both original NaNs and zeros we turned to NaN) forward/backward
+                        fill_series = fill_series.ffill().bfill()
+
+                        # Assign 0 only to initial rest rows (before first C/D)
+                        fill_series[initial_rest_mask] = 0
+
+                        cycle_series = fill_series
+
+                        logger.debug(f"Assigned initial {initial_rest_mask.sum()} rest rows (before first C/D) to cycle_number=0; filled zeros after first C/D where possible")
+                    else:
+                        # No C/D rows found; all R rows would be initial rest
+                        rest_mask = mode_series.isin(['R', 'REST'])
+                        cycle_series = cycle_series.ffill().bfill()
+                        cycle_series[rest_mask] = 0
+                        logger.debug("No C/D rows found; all R rows assigned to cycle_number=0")
+                    
+                    # Fill any remaining NaN with 1 (shouldn't happen in well-formed data)
+                    cycle_series = cycle_series.fillna(1)
+                else:
+                    # No mode column, use raw cycle numbers
+                    cycle_series = cycle_series.ffill().bfill().fillna(1)
+                
+                processed_data['cycle_number'] = cycle_series.astype(int)
             else:
                 processed_data['cycle_number'] = 1
                 logger.warning("Column 'Echem_Cycle' not found in Maccor data")
@@ -488,8 +545,8 @@ class DataProcessor:
                     # OPTIMIZATION: Use pre-computed masks to avoid .isin() calls within loop
                     charge_mask_cycle = mode_charge_mask.loc[cycle_idx]
                     discharge_mask_cycle = mode_discharge_mask.loc[cycle_idx]
-                    charge_idx = cycle_idx[charge_mask_cycle]
-                    discharge_idx = cycle_idx[discharge_mask_cycle]
+                    charge_idx = cycle_idx[np.asarray(charge_mask_cycle)]
+                    discharge_idx = cycle_idx[np.asarray(discharge_mask_cycle)]
 
                     charge_endpoint = previous_discharge_endpoint
 
