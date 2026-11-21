@@ -1,459 +1,588 @@
-from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QComboBox, QLineEdit, QPushButton, QCheckBox,
-                             QGroupBox, QFormLayout, QMessageBox, QApplication)
-from PySide6.QtCore import Qt
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 import logging
+import re
+from bisect import bisect_left, bisect_right
+from dataclasses import dataclass
 
-# Get logger for this module
-logger = logging.getLogger(__name__)
+import numpy as np
+import pandas as pd
+from matplotlib import colormaps
+from matplotlib.lines import Line2D
+from PySide6.QtCore import QItemSelectionModel, QSignalBlocker, Qt, Signal
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QFormLayout, QFrame, QHBoxLayout, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QPushButton, QScrollArea, QSpinBox, QSplitter,
+    QVBoxLayout, QWidget,
+)
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+from matplotlib.figure import Figure
 
-# Add parent directory to path
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from analysis.data_processor import DataProcessor
+from ui.point_inspector import PointInspector
 
-class AnalysisWindow(QDialog):
+
+logger = logging.getLogger(__name__)
+MAX_ANALYSIS_BATTERIES = 10
+SAMPLE_COLORS = colormaps["tab10"].colors
+
+
+@dataclass(frozen=True)
+class PlotDefinition:
+    x: str
+    x_label: str
+    y_label: str
+    series: tuple
+    export_columns: tuple
+    processor: object = None
+    per_cycle: bool = False
+
+
+PLOTS = {
+    "Voltage vs. Time": PlotDefinition(
+        "time_h", "Time (h)", "Voltage (V)", (("voltage_V", "Voltage"),),
+        ("time_h", "voltage_V"), per_cycle=True,
+    ),
+    "Cycling vs. Capacity": PlotDefinition(
+        "cycle_number", "Cycle number", "Capacity (mAh/g)",
+        (("charge_cap_mAh_g", "Charge"), ("discharge_cap_mAh_g", "Discharge")),
+        ("cycle_number", "charge_cap_mAh_g", "discharge_cap_mAh_g"), DataProcessor.cycling_vs_capacity,
+    ),
+    "Cycling vs. Accumulated Energy": PlotDefinition(
+        "cycle_number", "Cycle number", "Accumulated energy (Wh)", (("Accu_Energy_Wh", "Energy"),),
+        ("cycle_number", "Accu_Energy_Wh"), DataProcessor.cycling_vs_accumulated_energy,
+    ),
+    "dQ/dV": PlotDefinition(
+        "voltage_V", "Voltage (V)", "dQ/dV (mAh/g/V)",
+        (("dQdV_charge", "Charge"), ("dQdV_discharge", "Discharge")),
+        ("voltage_V", "dQdV_charge", "dQdV_discharge"), per_cycle=True,
+    ),
+    "dV/dQ": PlotDefinition(
+        "discharge_cap_mAh_g", "Discharge capacity (mAh/g)", "dV/dQ (V g/mAh)",
+        (("dVdQ", "Discharge"),), ("cycle_number", "discharge_cap_mAh_g", "dVdQ"),
+        DataProcessor.dvdq, per_cycle=True,
+    ),
+    "Voltage vs. Capacity cyclic": PlotDefinition(
+        "(Q-Qo)_mAh_g", "Capacity (Q − Q₀) (mAh/g)", "Voltage (V)", (("voltage_V", "Voltage"),),
+        ("cycle_number", "voltage_V", "(Q-Qo)_mAh_g"), DataProcessor.voltage_vs_capacity_cyclic,
+        per_cycle=True,
+    ),
+    "Cycling vs. Overvoltage": PlotDefinition(
+        "cycle_number", "Cycle number", "Overvoltage (V)", (("Overvoltage", "Overvoltage"),),
+        ("cycle_number", "Overvoltage"), DataProcessor.cycling_vs_overvoltage,
+    ),
+    "Cycling vs. Endpointslippage": PlotDefinition(
+        "cycle_number", "Cycle number", "Endpoint slippage (mAh/g)",
+        (("discharge_endpoint", "Discharge"), ("charge_endpoint", "Charge")),
+        ("cycle_number", "discharge_endpoint", "charge_endpoint"), DataProcessor.cycling_vs_endpointslippage,
+    ),
+}
+
+
+class AnalysisWindow(QWidget):
+    back_requested = Signal()
+    export_requested = Signal()
+    selection_requested = Signal()
+
     def __init__(self, parent=None, processed_data=None, cell_id=None):
         super().__init__(parent)
-        try:
-            logger.info(f"Opening analysis window for cell: {cell_id}")
-            self.setWindowTitle(f"Data Analysis - Cell {cell_id}")
-            self.resize(650, 480)
-            
-            self.processed_data = processed_data
-            self.cell_id = cell_id
-            self.filtered_data = None
-            
-            self.init_ui()
-            logger.debug(f"Analysis window initialized for cell: {cell_id}")
-        except Exception as e:
-            logger.error(f"Error initializing AnalysisWindow: {e}", exc_info=True)
-            raise
-    
+        self.samples = {cell_id: processed_data} if processed_data is not None else {}
+        self.selected_battery_ids = tuple(self.samples)
+        self._pending = ()
+        self._load_errors = {}
+        self._has_loaded_sample = bool(self.samples)
+        self.available_cycles = self._available_cycles()
+        self._repeat_plot = False
+        self._result = None
+        self.init_ui()
+
     def init_ui(self):
-        layout = QVBoxLayout()
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-        self.setLayout(layout)
-        
-        # Analysis Type Selection
-        type_group = QGroupBox("Analysis Type")
-        type_layout = QVBoxLayout()
-        type_group.setLayout(type_layout)
-        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 14)
+        layout.setSpacing(13)
+        header = QHBoxLayout()
+        back = QPushButton("Back to batteries")
+        back.clicked.connect(self.back_requested)
+        self.title = QLabel()
+        self.title.setObjectName("pageTitle")
+        self.title.setTextFormat(Qt.TextFormat.PlainText)
+        self.title.setWordWrap(True)
+        self.export_btn = QPushButton("Export processed CSV…")
+        self.export_btn.clicked.connect(self.export_requested)
+        header.addWidget(back)
+        header.addWidget(self.title, 1)
+        header.addWidget(self.export_btn)
+        layout.addLayout(header)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(12)
+        layout.addWidget(splitter, 1)
+
+        controls = QFrame()
+        controls.setObjectName("analysisControls")
+        controls.setMinimumWidth(250)
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(16, 15, 16, 15)
+        controls_layout.setSpacing(8)
+        controls_layout.addWidget(self._create_sample_picker())
+        type_label = QLabel("&Analysis type")
         self.analysis_type_combo = QComboBox()
-        self.analysis_type_combo.addItems([
-            "Voltage vs. Time",
-            "Cycling vs. Capacity",
-            "Cycling vs. Accumulated Energy",
-            "dQ/dV",
-            "dV/dQ",
-            "Voltage vs. Capacity cyclic",
-            "Cycling vs. Overvoltage",
-            "Cycling vs. Endpointslippage"
-        ])
-        type_layout.addWidget(QLabel("Select Analysis:"))
-        type_layout.addWidget(self.analysis_type_combo)
-        
-        layout.addWidget(type_group)
-        
-        # Cycles Selection
-        cycles_group = QGroupBox("Cycle Selection")
-        cycles_layout = QVBoxLayout()
-        cycles_group.setLayout(cycles_layout)
-        
-        # All cycles checkbox
-        self.all_cycles_chk = QCheckBox("All")
-        self.all_cycles_chk.setChecked(True)
-        self.all_cycles_chk.stateChanged.connect(self.on_all_cycles_changed)
-        
-        # Cycles input
-        cycles_input_layout = QHBoxLayout()
-        cycles_input_layout.addWidget(QLabel("Cycles:"))
-        self.cycles_input = QLineEdit()
-        self.cycles_input.setPlaceholderText("e.g., 1,3,5 or 1-5")
-        self.cycles_input.setEnabled(False)  # Disabled when "All" is checked
-        self.cycles_input.textChanged.connect(self.on_cycles_input_changed)
-        cycles_input_layout.addWidget(self.cycles_input)
-        
-        cycles_layout.addWidget(self.all_cycles_chk)
-        cycles_layout.addLayout(cycles_input_layout)
-        
-        layout.addWidget(cycles_group)
-        
-        # Interpolation Options (for dQ/dV)
-        self.interp_group = QGroupBox("Interpolation (dQ/dV only)")
-        interp_layout = QHBoxLayout()
-        self.interp_group.setLayout(interp_layout)
-        
-        self.interp_chk = QCheckBox("Enable Interpolation")
-        self.interp_chk.setChecked(False)
-        interp_layout.addWidget(self.interp_chk)
-        
-        interp_layout.addWidget(QLabel("Points:"))
-        self.interp_points_input = QLineEdit("1000")
-        self.interp_points_input.setMaximumWidth(80)
-        interp_layout.addWidget(self.interp_points_input)
-        interp_layout.addStretch()
-        
-        layout.addWidget(self.interp_group)
-        
-        # Connect analysis type change to show/hide interpolation
-        self.analysis_type_combo.currentTextChanged.connect(self.on_analysis_type_changed)
-        self.on_analysis_type_changed(self.analysis_type_combo.currentText())
-        
-        # Action Buttons
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(8)
-        
-        self.extract_btn = QPushButton("Extract Data")
-        self.extract_btn.clicked.connect(self.extract_data)
-        btn_layout.addWidget(self.extract_btn)
-        
-        self.preview_btn = QPushButton("Data Preview")
+        self.analysis_type_combo.addItems(PLOTS.keys())
+        type_label.setBuddy(self.analysis_type_combo)
+        controls_layout.addWidget(type_label)
+        controls_layout.addWidget(self.analysis_type_combo)
+
+        self.cycle_availability = QLabel()
+        self.cycle_availability.setWordWrap(True)
+        controls_layout.addWidget(self.cycle_availability)
+        self.all_cycles_chk = QCheckBox("All test cycles")
+        self.all_cycles_chk.setChecked(self.available_cycles != [0])
+        controls_layout.addWidget(self.all_cycles_chk)
+        self.cycles_input = QLineEdit("0" if self.available_cycles == [0] else "")
+        self.cycles_input.setAccessibleName("Cycle numbers")
+        self.cycles_input.setPlaceholderText("e.g. 1,3,5 or 1–5")
+        controls_layout.addWidget(self.cycles_input)
+        self.zero_note = QLabel("Enter 0 to include the pre-cycle / rest segment.")
+        self.zero_note.setWordWrap(True)
+        controls_layout.addWidget(self.zero_note)
+
+        self.interpolation_settings = QWidget()
+        interpolation_layout = QFormLayout(self.interpolation_settings)
+        interpolation_layout.setContentsMargins(0, 0, 0, 0)
+        self.interp_chk = QCheckBox("Interpolate dQ/dV")
+        self.interp_points_input = QSpinBox()
+        self.interp_points_input.setRange(2, 1000000)
+        self.interp_points_input.setValue(1000)
+        interpolation_layout.addRow(self.interp_chk)
+        interpolation_layout.addRow("Points", self.interp_points_input)
+        controls_layout.addWidget(self.interpolation_settings)
+
+        self.preview_btn = QPushButton("Plot selected cycles")
+        self.preview_btn.setProperty("primary", True)
         self.preview_btn.clicked.connect(self.data_preview)
-        btn_layout.addWidget(self.preview_btn)
-        
-        self.close_btn = QPushButton("Close")
-        self.close_btn.clicked.connect(self.close)
-        btn_layout.addWidget(self.close_btn)
-        
-        layout.addLayout(btn_layout)
-    
-    def on_all_cycles_changed(self, state):
-        """Enable/disable cycles input based on 'All' checkbox"""
-        is_checked = state == Qt.CheckState.Checked.value
-        self.cycles_input.setEnabled(not is_checked)
-        if is_checked:
-            self.cycles_input.clear()
-    
-    def on_cycles_input_changed(self, text):
-        """Uncheck 'All' when user types in cycles input"""
-        if text.strip():
-            self.all_cycles_chk.setChecked(False)
-    
-    def on_analysis_type_changed(self, analysis_type):
-        """Show/hide interpolation options based on analysis type"""
-        if analysis_type == "dQ/dV":
-            # Always show interpolation group for dQ/dV
-            self.interp_group.setVisible(True)
+        self.extract_btn = QPushButton("Copy plotted data")
+        self.extract_btn.clicked.connect(self.extract_data)
+        controls_layout.addWidget(self.preview_btn)
+        controls_layout.addWidget(self.extract_btn)
+        self.feedback = QLabel()
+        self.feedback.setTextFormat(Qt.TextFormat.PlainText)
+        self.feedback.setWordWrap(True)
+        self.feedback.setAccessibleName("Analysis status")
+        controls_layout.addWidget(self.feedback)
+        controls_layout.addStretch()
+
+        chart_panel = QWidget()
+        chart_layout = QVBoxLayout(chart_panel)
+        chart_layout.setContentsMargins(0, 0, 0, 0)
+        chart_layout.setSpacing(3)
+        self.figure = Figure(figsize=(7, 5), layout="constrained")
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas.setAccessibleName("Analysis chart")
+        self.canvas.setMinimumSize(250, 250)
+        self.toolbar = NavigationToolbar2QT(self.canvas, chart_panel, coordinates=False)
+        self.canvas.setMouseTracking(True)
+        self.point_inspector = PointInspector(self.canvas)
+        chart_layout.addWidget(self.toolbar)
+        chart_layout.addWidget(self.canvas, 1)
+        control_scroll = QScrollArea()
+        control_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        control_scroll.setWidgetResizable(True)
+        control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        control_scroll.setMinimumWidth(265)
+        control_scroll.setWidget(controls)
+        splitter.addWidget(control_scroll)
+        splitter.addWidget(chart_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([290, 880])
+
+        for signal in (self.analysis_type_combo.currentTextChanged, self.all_cycles_chk.toggled,
+                       self.cycles_input.textChanged, self.interp_chk.toggled,
+                       self.interp_points_input.valueChanged):
+            signal.connect(self.update_controls)
+        self.cycles_input.returnPressed.connect(self.data_preview)
+        self._update_sample_info()
+        self.clear_plot()
+        self.update_controls()
+
+    def _create_sample_picker(self):
+        self.sample_picker = QWidget()
+        layout = QVBoxLayout(self.sample_picker)
+        layout.setContentsMargins(0, 0, 0, 8)
+        layout.setSpacing(6)
+        label = QLabel("&Batteries")
+        self.sample_search = QLineEdit()
+        self.sample_search.setAccessibleName("Search analysis batteries")
+        self.sample_search.setPlaceholderText("Search batteries…")
+        self.sample_search.setClearButtonEnabled(True)
+        self.sample_list = QListWidget()
+        self.sample_list.setAccessibleName("Batteries to analyze")
+        self.sample_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.sample_list.setMinimumHeight(90)
+        self.sample_list.setMaximumHeight(128)
+        label.setBuddy(self.sample_list)
+        self.sample_status = QLabel()
+        self.sample_status.setWordWrap(True)
+        self.sample_status.setTextFormat(Qt.TextFormat.PlainText)
+        tip = QLabel("Click to switch. Ctrl/Shift to compare.")
+        tip.setWordWrap(True)
+        layout.addWidget(label)
+        layout.addWidget(self.sample_search)
+        layout.addWidget(self.sample_list)
+        layout.addWidget(tip)
+        layout.addWidget(self.sample_status)
+        self.sample_search.textChanged.connect(self._filter_batteries)
+        self.sample_list.itemSelectionChanged.connect(self._on_sample_selection)
+        self.sample_picker.hide()
+        return self.sample_picker
+
+    def set_batteries(self, records, *, preserve_selection=True):
+        selected = self.selected_battery_ids if preserve_selection else ()
+        with QSignalBlocker(self.sample_list), QSignalBlocker(self.sample_search):
+            if not preserve_selection:
+                self.sample_search.clear()
+            self.sample_list.clear()
+            for cell_id in sorted((key for key in records if key), key=str.casefold):
+                record = records[cell_id]
+                item = QListWidgetItem(cell_id)
+                details = " · ".join(str(record[key]) for key in ("instrument", "date", "positive_electrode")
+                                     if record.get(key))
+                item.setData(Qt.ItemDataRole.UserRole, f"{cell_id} {details}".casefold())
+                item.setToolTip(details)
+                self.sample_list.addItem(item)
+            self._filter_batteries()
+            self._set_list_selection(selected)
+        self.sample_picker.show()
+        self._on_sample_selection()
+        if not self.selected_battery_ids:
+            self.set_samples({}, (), {})
+
+    def _filter_batteries(self):
+        terms = self.sample_search.text().casefold().split()
+        for row in range(self.sample_list.count()):
+            item = self.sample_list.item(row)
+            item.setHidden(not all(term in item.data(Qt.ItemDataRole.UserRole) for term in terms))
+
+    def select_batteries(self, cell_ids):
+        if len(cell_ids) > MAX_ANALYSIS_BATTERIES:
+            return
+        with QSignalBlocker(self.sample_list), QSignalBlocker(self.sample_search):
+            self.sample_search.clear()
+            self._filter_batteries()
+            self._set_list_selection(cell_ids)
+        self._on_sample_selection()
+        if self.sample_list.currentItem() is not None:
+            self.sample_list.scrollToItem(self.sample_list.currentItem())
+
+    def _set_list_selection(self, cell_ids):
+        selection = self.sample_list.selectionModel()
+        selection.clearSelection()
+        selected_rows = []
+        for row in range(self.sample_list.count()):
+            if self.sample_list.item(row).text() in cell_ids:
+                index = self.sample_list.model().index(row, 0)
+                selection.select(index, QItemSelectionModel.SelectionFlag.Select)
+                selected_rows.append(row)
+        self.sample_list.setCurrentRow(selected_rows[0] if selected_rows else -1,
+                                       QItemSelectionModel.SelectionFlag.NoUpdate)
+
+    def _on_sample_selection(self):
+        selected_rows = self.sample_list.selectionModel().selectedRows()
+        selected = tuple(self.sample_list.item(index.row()).text()
+                         for index in sorted(selected_rows, key=lambda index: index.row()))
+        if len(selected) > MAX_ANALYSIS_BATTERIES:
+            with QSignalBlocker(self.sample_list):
+                self._set_list_selection(self.selected_battery_ids)
+            self.sample_status.setText(f"Select up to {MAX_ANALYSIS_BATTERIES} batteries.")
+            return
+        if selected != self.selected_battery_ids:
+            self.selected_battery_ids = selected
+            self.selection_requested.emit()
+        self._update_sample_info()
+
+    def _available_cycles(self):
+        cycles = set()
+        for data in self.samples.values():
+            if "cycle_number" in data:
+                cycles.update(int(cycle) for cycle in data["cycle_number"].dropna().unique())
+        return sorted(cycles)
+
+    def set_samples(self, ready, pending, errors):
+        pending = tuple(pending)
+        same_samples = tuple(ready) == tuple(self.samples) and all(
+            frame is self.samples[cell_id] for cell_id, frame in ready.items()
+        )
+        changed = not same_samples or pending != self._pending or errors != self._load_errors
+        self.samples = ready
+        self._pending = pending
+        self._load_errors = errors
+        self._update_sample_info()
+        if not changed:
+            return
+        if not same_samples:
+            self.available_cycles = self._available_cycles()
+        if self.samples and not pending and not self._has_loaded_sample:
+            self._has_loaded_sample = True
+            if self.available_cycles == [0] and self.all_cycles_chk.isChecked():
+                with QSignalBlocker(self.all_cycles_chk), QSignalBlocker(self.cycles_input):
+                    self.all_cycles_chk.setChecked(False)
+                    self.cycles_input.setText("0")
+        self.update_controls()
+        if self._repeat_plot and self.preview_btn.isEnabled():
+            self.data_preview()
+
+    def _update_sample_info(self):
+        count = len(self.selected_battery_ids)
+        if count == 1:
+            self.title.setText(f"Analysis · {self.selected_battery_ids[0]}")
+        elif count:
+            self.title.setText(f"Analysis · {count} batteries")
         else:
-            self.interp_group.setVisible(False)
-    
-    def parse_cycles(self):
-        """Parse cycles input and return list of cycle numbers"""
-        if self.all_cycles_chk.isChecked():
-            # Return all unique cycles except cycle 0 (pre-cycle/rest block)
-            all_cycles = self.processed_data['cycle_number'].unique().tolist()
-            return sorted([c for c in all_cycles if c != 0])
-        
-        cycles_text = self.cycles_input.text().strip()
-        if not cycles_text:
-            QMessageBox.warning(self, "Error", "Please specify cycles or check 'All'")
-            return None
-        
-        cycles = []
-        try:
-            # Parse comma-separated values and ranges
-            parts = cycles_text.split(',')
-            for part in parts:
-                part = part.strip()
-                if '-' in part:
-                    # Range like "1-5"
-                    start, end = part.split('-')
-                    cycles.extend(range(int(start), int(end) + 1))
-                else:
-                    # Single value like "3"
-                    cycles.append(int(part))
-            
-            return sorted(list(set(cycles)))  # Remove duplicates and sort
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Invalid cycle format: {str(e)}")
-            return None
-    
-    def filter_data_by_cycles(self, cycles):
-        """Filter processed data by selected cycles"""
-        if cycles is None:
-            return None
-        
-        filtered = self.processed_data[self.processed_data['cycle_number'].isin(cycles)]
-        
-        if filtered.empty:
-            QMessageBox.warning(self, "Error", "No data found for selected cycles")
-            return None
-        
-        return filtered
-    
-    def extract_data(self):
-        """Extract data based on analysis type and copy to clipboard"""
-        try:
-            analysis_type = self.analysis_type_combo.currentText()
-            cycles = self.parse_cycles()
-            
-            if cycles is None:
-                logger.warning(f"Extract data failed: invalid cycle selection")
-                return
-            
-            logger.info(f"Extracting {analysis_type} data for cell {self.cell_id}, cycles {cycles}")
-            
-            # Process data based on analysis type
-            try:
-                if analysis_type == "Voltage vs. Time":
-                    filtered_data = self.processed_data[self.processed_data['cycle_number'].isin(cycles)]
-                    extract_df = filtered_data[['time_h', 'voltage_V']].copy()
-                    extract_df.columns = ['Time (h)', 'Voltage (V)']
-                
-                elif analysis_type == "Cycling vs. Capacity":
-                    analysis_data = DataProcessor.cycling_vs_capacity(self.processed_data)
-                    extract_df = analysis_data[analysis_data['cycle_number'].isin(cycles)][['cycle_number', 'charge_cap_mAh_g', 'discharge_cap_mAh_g']]
-                
-                elif analysis_type == "Cycling vs. Accumulated Energy":
-                    analysis_data = DataProcessor.cycling_vs_accumulated_energy(self.processed_data)
-                    extract_df = analysis_data[analysis_data['cycle_number'].isin(cycles)][['cycle_number', 'Accu_Energy_Wh']]
-                
-                elif analysis_type == "Cycling vs. Overvoltage":
-                    analysis_data = DataProcessor.cycling_vs_overvoltage(self.processed_data)
-                    extract_df = analysis_data[analysis_data['cycle_number'].isin(cycles)][['cycle_number', 'Overvoltage']]
-                
-                elif analysis_type == "Voltage vs. Capacity cyclic":
-                    analysis_data = DataProcessor.voltage_vs_capacity_cyclic(self.processed_data)
-                    filtered_data = analysis_data[analysis_data['cycle_number'].isin(cycles)]
-                    extract_df = filtered_data[['cycle_number', 'voltage_V', '(Q-Qo)_mAh_g']]
-                
-                elif analysis_type == "Cycling vs. Endpointslippage":
-                    analysis_data = DataProcessor.cycling_vs_endpointslippage(self.processed_data)
-                    extract_df = analysis_data[analysis_data['cycle_number'].isin(cycles)][['cycle_number', 'discharge_endpoint', 'charge_endpoint']]
-                
-                elif analysis_type == "dQ/dV":
-                    # Check interpolation settings
-                    use_interp = self.interp_chk.isChecked()
-                    interp_points = int(self.interp_points_input.text()) if use_interp else None
-                    analysis_data = DataProcessor.dqdv(self.processed_data, interpolate_flag=use_interp, interp_points=interp_points)
-                    # For dQ/dV, prepare data without cycle_number and type columns
-                    filtered = analysis_data[analysis_data['cycle_number'].isin(cycles)]
-                    # Group by cycle for special formatting
-                    extract_df = filtered[['voltage_V', 'dQdV_charge', 'dQdV_discharge']]
-                
-                elif analysis_type == "dV/dQ":
-                    analysis_data = DataProcessor.dvdq(self.processed_data)
-                    extract_df = analysis_data[analysis_data['cycle_number'].isin(cycles)][['cycle_number', 'discharge_cap_mAh_g', 'dVdQ']]
-                
-                else:
-                    logger.warning(f"Analysis type not implemented: {analysis_type}")
-                    QMessageBox.information(self, "Info", f"{analysis_type} not implemented yet")
-                    return
-                
-                # Prepare data with header rows
-                import io
-                output = io.StringIO()
-                
-                # Write column headers
-                output.write('\t'.join(extract_df.columns) + '\n')
-                
-                # Add empty row and ID row
-                output.write('\n')  # Empty row
-                if analysis_type == "dQ/dV":
-                    # For dQ/dV, add cycle info after ID
-                    cycle_info = '_'.join([str(c) for c in cycles])
-                    output.write(f'{self.cell_id}_{cycle_info}\n')
-                else:
-                    output.write(f'{self.cell_id}\n')
-                
-                # Write data
-                extract_df.to_csv(output, sep='\t', index=False, header=False)
-                
-                # Copy to clipboard
-                QApplication.clipboard().setText(output.getvalue())
-                logger.info(f"Data extracted and copied to clipboard: {len(extract_df)} rows")
-                QMessageBox.information(self, "Success", "Data copied to clipboard.")
-            except Exception as e:
-                logger.error(f"Error extracting {analysis_type} data: {e}", exc_info=True)
-                QMessageBox.critical(self, "Error", f"Failed to extract data: {str(e)}")
-        except Exception as e:
-            logger.error(f"Error in extract_data: {e}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to extract data: {str(e)}")
-    
-    def data_preview(self):
-        """Preview data with plot in a popup window"""
-        try:
-            analysis_type = self.analysis_type_combo.currentText()
-            cycles = self.parse_cycles()
-            
-            if cycles is None:
-                logger.warning(f"Preview failed: invalid cycle selection")
-                return
-            
-            logger.info(f"Previewing {analysis_type} data for cell {self.cell_id}, cycles {cycles}")
-            
-            if analysis_type == "Voltage vs. Time":
-                filtered_data = self.processed_data[self.processed_data['cycle_number'].isin(cycles)]
-                self.show_plot(filtered_data, cycles, analysis_type)
-            
-            elif analysis_type == "Cycling vs. Capacity":
-                analysis_data = DataProcessor.cycling_vs_capacity(self.processed_data)
-                filtered = analysis_data[analysis_data['cycle_number'].isin(cycles)]
-                self.show_plot(filtered, cycles, analysis_type)
-            
-            elif analysis_type == "Cycling vs. Accumulated Energy":
-                analysis_data = DataProcessor.cycling_vs_accumulated_energy(self.processed_data)
-                filtered = analysis_data[analysis_data['cycle_number'].isin(cycles)]
-                self.show_plot(filtered, cycles, analysis_type)
-            
-            elif analysis_type == "Cycling vs. Overvoltage":
-                analysis_data = DataProcessor.cycling_vs_overvoltage(self.processed_data)
-                filtered = analysis_data[analysis_data['cycle_number'].isin(cycles)]
-                self.show_plot(filtered, cycles, analysis_type)
-            
-            elif analysis_type == "Voltage vs. Capacity cyclic":
-                analysis_data = DataProcessor.voltage_vs_capacity_cyclic(self.processed_data)
-                filtered = analysis_data[analysis_data['cycle_number'].isin(cycles)]
-                self.show_plot(filtered, cycles, analysis_type)
-            
-            elif analysis_type == "Cycling vs. Endpointslippage":
-                analysis_data = DataProcessor.cycling_vs_endpointslippage(self.processed_data)
-                filtered = analysis_data[analysis_data['cycle_number'].isin(cycles)]
-                self.show_plot(filtered, cycles, analysis_type)
-            
-            elif analysis_type == "dQ/dV":
-                # Check interpolation settings
-                use_interp = self.interp_chk.isChecked()
-                interp_points = int(self.interp_points_input.text()) if use_interp else None
-                logger.debug(f"dQ/dV with interpolation={use_interp}, points={interp_points}")
-                analysis_data = DataProcessor.dqdv(self.processed_data, interpolate_flag=use_interp, interp_points=interp_points)
-                filtered = analysis_data[analysis_data['cycle_number'].isin(cycles)]
-                self.show_plot(filtered, cycles, analysis_type)
-            
-            elif analysis_type == "dV/dQ":
-                analysis_data = DataProcessor.dvdq(self.processed_data)
-                filtered = analysis_data[analysis_data['cycle_number'].isin(cycles)]
-                self.show_plot(filtered, cycles, analysis_type)
-            
+            self.title.setText("Analysis")
+        self.export_btn.setEnabled(count == 1 and self.selected_battery_ids[0] in self.samples)
+        self.export_btn.setToolTip("Select one battery to export its processed CSV." if count != 1 else "")
+        message = f"{count} / {MAX_ANALYSIS_BATTERIES} selected"
+        if self._pending:
+            message += f" · Loading {self._pending[0]}…"
+        if self._load_errors:
+            cell_id, error = next(iter(self._load_errors.items()))
+            message += f"\n{cell_id}: {error}"
+            if len(self._load_errors) > 1:
+                message += f"\n{len(self._load_errors)} batteries unavailable."
+        self.sample_status.setText(message)
+        self.sample_status.setToolTip("\n".join(f"{cell_id}: {error}" for cell_id, error in self._load_errors.items()))
+
+    def format_cycle_ranges(self):
+        if not self.available_cycles:
+            return ""
+        start = end = self.available_cycles[0]
+        ranges = []
+        for cycle in self.available_cycles[1:]:
+            if cycle == end + 1:
+                end = cycle
             else:
-                logger.warning(f"Analysis type not implemented: {analysis_type}")
-                QMessageBox.information(self, "Info", f"{analysis_type} not implemented yet")
-        except Exception as e:
-            logger.error(f"Error in data preview: {e}", exc_info=True)
-            QMessageBox.critical(self, "Error", f"Failed to preview data: {str(e)}")
-    
-    def show_plot(self, data, cycles, analysis_type):
-        """Show plot based on analysis type"""
-        try:
-            logger.debug(f"Creating plot for {analysis_type}")
-            preview_window = PlotPreviewWindow(self, self.cell_id, analysis_type)
-            
-            fig = preview_window.figure
-            ax = fig.add_subplot(111)
-            
+                ranges.append(str(start) if start == end else f"{start}–{end}")
+                start = end = cycle
+        ranges.append(str(start) if start == end else f"{start}–{end}")
+        if len(ranges) > 8:
+            return ", ".join(ranges[:7]) + f", …, {ranges[-1]}"
+        return ", ".join(ranges)
+
+    def parse_cycles(self):
+        cycles, _ = self._read_cycle_selection()
+        return cycles
+
+    def _read_cycle_selection(self):
+        if self._pending:
+            return None, "Waiting for the selected batteries to load."
+        if not self.available_cycles:
+            return None, "No cycles are available to plot."
+        if self.all_cycles_chk.isChecked():
+            cycles = [cycle for cycle in self.available_cycles if cycle != 0]
+            return (cycles, "") if cycles else (None, "Only Cycle 0 is available. Enter 0 to plot it.")
+        text = self.cycles_input.text().strip()
+        if not text:
+            return None, "Enter cycle numbers or ranges."
+        cycles = set()
+        unavailable = []
+        for part in text.split(","):
+            part = part.strip()
+            match = re.fullmatch(r"(\d{1,18})(?:\s*[-–]\s*(\d{1,18}))?", part)
+            if not match:
+                return None, "Use comma-separated cycle numbers or ranges, such as 1,3,5–10."
+            first = int(match[1])
+            last = int(match[2] or match[1])
+            if first > last:
+                return None, "A cycle range must start at or below its end."
+            start = bisect_left(self.available_cycles, first)
+            stop = bisect_right(self.available_cycles, last)
+            if start == stop:
+                unavailable.append(part)
+            else:
+                cycles.update(self.available_cycles[start:stop])
+        if not cycles:
+            return None, "No recorded cycles match this selection."
+        notice = f"Unavailable cycle entries: {', '.join(unavailable)}." if unavailable else ""
+        return sorted(cycles), notice
+
+    def update_controls(self):
+        self.cycles_input.setEnabled(not self.all_cycles_chk.isChecked())
+        dq_dv_selected = self.analysis_type_combo.currentText() == "dQ/dV"
+        self.interpolation_settings.setVisible(dq_dv_selected)
+        self.interp_points_input.setEnabled(self.interp_chk.isChecked())
+        available = self.format_cycle_ranges()
+        self.cycle_availability.setText(f"Available cycles: {available}" if available else "No cycles loaded.")
+        self.zero_note.setVisible(0 in self.available_cycles)
+        cycles, notice = self._read_cycle_selection()
+        self.preview_btn.setEnabled(cycles is not None)
+        if self._result is not None:
+            self.clear_plot()
+        self.feedback.setToolTip("")
+        if cycles is None:
+            self.feedback.setText(notice)
+            return
+        message = f"{len(cycles):,} cycle(s) selected."
+        self.feedback.setText(f"{message}\n{notice}" if notice else message)
+
+    def clear_plot(self):
+        self._result = None
+        self.point_inspector.set_curves()
+        self.figure.clear()
+        self.toolbar.update()
+        self.toolbar.setEnabled(False)
+        self.extract_btn.setEnabled(False)
+        axes = self.figure.add_subplot()
+        axes.set_axis_off()
+        axes.text(0.5, 0.5, "Select cycles and plot to preview the data.",
+                  ha="center", va="center", color="#52636a", transform=axes.transAxes)
+        self.canvas.draw_idle()
+
+    def data_preview(self):
+        cycles, notice = self._read_cycle_selection()
+        if cycles is None:
+            self.feedback.setText(notice)
+            return
+        self._repeat_plot = True
+        analysis_type = self.analysis_type_combo.currentText()
+        definition = PLOTS[analysis_type]
+        self.point_inspector.set_curves()
+        self.figure.clear()
+        axes = self.figure.add_subplot()
+        comparison = len(self.selected_battery_ids) > 1
+        results, issues, counts, curves, legend = {}, {}, {}, [], []
+        for index, (cell_id, sample) in enumerate(self.samples.items()):
             try:
+                data = self._analyze(sample, cycles, analysis_type, definition)
+                drawn, drawn_cycles = self._draw_sample(
+                    axes, data, cell_id, analysis_type, definition, SAMPLE_COLORS[index], comparison
+                )
+            except Exception as error:
+                logger.exception("Could not plot %s for %s", analysis_type, cell_id)
+                issues[cell_id] = str(error)
+                continue
+            if not drawn:
+                issues[cell_id] = "No usable data for the selected cycles."
+                continue
+            results[cell_id] = data
+            counts[cell_id] = len(drawn_cycles)
+            curves.extend(drawn)
+            legend.append(Line2D([], [], color=SAMPLE_COLORS[index], linewidth=2, label=cell_id))
+
+        if not results:
+            self.clear_plot()
+            details = "\n".join(f"{key}: {value}" for key, value in issues.items())
+            self.feedback.setText(next(iter(issues.values()), "No usable data for the selected cycles."))
+            self.feedback.setToolTip(details)
+            return
+
+        if comparison:
+            if len(definition.series) > 1:
+                legend.extend(Line2D([], [], color="0.35", linestyle="--" if name == "Discharge" else "-", label=name)
+                              for _, name in definition.series)
+            axes.legend(handles=legend, fontsize=8, ncols=2 if len(legend) > 5 else 1, loc="best")
+            title = f"{analysis_type} · {len(results)} batteries"
+        else:
+            if 1 < len(curves) <= 12 or (definition.per_cycle and len(curves) == 1):
+                axes.legend(fontsize=9)
+            title = f"{analysis_type} · {next(iter(results))}"
+        axes.set(xlabel=definition.x_label, ylabel=definition.y_label, title=title)
+        axes.spines[["top", "right"]].set_visible(False)
+        axes.grid(True, alpha=0.24)
+        self.point_inspector.set_curves(axes, curves)
+        self.toolbar.update()
+        self.canvas.draw_idle()
+
+        self._result = analysis_type, cycles, results
+        self.extract_btn.setEnabled(True)
+        self.toolbar.setEnabled(True)
+        summaries = [f"{cell_id}: {count} of {len(cycles)} selected cycles plotted" for cell_id, count in counts.items()]
+        if comparison:
+            message = f"Plotted {len(results)} of {len(self.selected_battery_ids)} batteries."
+        else:
+            message = f"Plotted {next(iter(counts.values())):,} of {len(cycles):,} selected cycles."
+        if issues:
+            cell_id, reason = next(iter(issues.items()))
+            message += f"\n{cell_id}: {reason}"
+            summaries.extend(f"{key}: {value}" for key, value in issues.items())
+        if notice:
+            message += f"\n{notice}"
+        self.feedback.setText(message)
+        self.feedback.setToolTip("\n".join(summaries))
+
+    def _analyze(self, sample, cycles, analysis_type, definition):
+        selected = sample[sample["cycle_number"].isin(cycles)]
+        if selected.empty:
+            return selected
+        if analysis_type == "dQ/dV":
+            return DataProcessor.dqdv(
+                selected, interpolate_flag=self.interp_chk.isChecked(), interp_points=self.interp_points_input.value()
+            )
+        if definition.processor:
+            data = definition.processor(sample)
+            return data[data["cycle_number"].isin(cycles)]
+        return selected
+
+    @staticmethod
+    def _draw_sample(axes, data, cell_id, analysis_type, definition, color, comparison):
+        curves = []
+        plotted_cycles = set()
+        groups = data.groupby("cycle_number") if definition.per_cycle else [(None, data)]
+        for group_index, (cycle, block) in enumerate(groups):
+            for index, (column, name) in enumerate(definition.series):
+                if column not in block:
+                    continue
+                series = block[block["type"] == name.lower()] if analysis_type == "dQ/dV" else block
+                x, y = series[definition.x], series[column]
+                valid = np.isfinite(x) & np.isfinite(y)
+                if not valid.any():
+                    continue
+                plotted_cycles.update(series.loc[valid, "cycle_number"].unique())
+                style = "-" if name != "Discharge" or len(definition.series) == 1 else "--"
+                if definition.per_cycle:
+                    label = "Cycle 0 (rest)" if cycle == 0 else f"Cycle {cycle}"
+                    if len(definition.series) > 1:
+                        label = f"{label} · {name}"
+                    series_color = color if comparison else SAMPLE_COLORS[group_index % len(SAMPLE_COLORS)]
+                    marker = "o" if valid.sum() == 1 else None
+                else:
+                    label = name
+                    series_color = color if comparison else ("#146b69", "#6557a1")[index]
+                    marker = "o"
+                line, = axes.plot(x, y, color=series_color, linestyle=style, label=label, linewidth=1.4,
+                                  marker=marker, markersize=3)
+                curves.append((line, f"{cell_id} · {label}"))
+        return curves, plotted_cycles
+
+    def extract_data(self):
+        if self._result is None:
+            return
+        analysis_type, cycles, results = self._result
+        try:
+            columns = PLOTS[analysis_type].export_columns
+            if len(self.selected_battery_ids) > 1:
+                columns = ("cycle_number", *(column for column in columns if column != "cycle_number"))
+                if analysis_type == "dQ/dV":
+                    columns = (*columns, "type")
+                frames = []
+                for cell_id, data in results.items():
+                    frame = data.reindex(columns=columns).copy()
+                    frame.insert(0, "Battery ID", cell_id)
+                    frames.append(frame)
+                copied = pd.concat(frames, ignore_index=True)
+                text = copied.to_csv(sep="\t", index=False)
+            else:
+                cell_id, data = next(iter(results.items()))
+                copied = data.reindex(columns=columns)
+                cell_label = cell_id
                 if analysis_type == "Voltage vs. Time":
-                    for cycle in cycles:
-                        cycle_data = data[data['cycle_number'] == cycle]
-                        # Special label for cycle 0 (pre-cycle/rest block)
-                        cycle_label = f'Cycle {cycle} (pre-cycle/rest)' if cycle == 0 else f'Cycle {cycle}'
-                        ax.plot(cycle_data['time_h'], cycle_data['voltage_V'], 
-                               label=cycle_label, linewidth=1.5)
-                    ax.set_xlabel('Time (h)', fontsize=12)
-                    ax.set_ylabel('Voltage (V)', fontsize=12)
-                
-                elif analysis_type == "Cycling vs. Capacity":
-                    ax.plot(data['cycle_number'], data['charge_cap_mAh_g'], 'o-', label='Charge', linewidth=2)
-                    ax.plot(data['cycle_number'], data['discharge_cap_mAh_g'], 's-', label='Discharge', linewidth=2)
-                    ax.set_xlabel('Cycle Number', fontsize=12)
-                    ax.set_ylabel('Capacity (mAh/g)', fontsize=12)
-                    ax.legend()
-                
-                elif analysis_type == "Cycling vs. Accumulated Energy":
-                    ax.plot(data['cycle_number'], data['Accu_Energy_Wh'], 'o-', linewidth=2, color='green')
-                    ax.set_xlabel('Cycle Number', fontsize=12)
-                    ax.set_ylabel('Accumulated Energy (Wh)', fontsize=12)
-                
-                elif analysis_type == "Cycling vs. Overvoltage":
-                    ax.plot(data['cycle_number'], data['Overvoltage'], 'o-', linewidth=2, color='red')
-                    ax.set_xlabel('Cycle Number', fontsize=12)
-                    ax.set_ylabel('Overvoltage (V)', fontsize=12)
-                
-                elif analysis_type == "Voltage vs. Capacity cyclic":
-                    for cycle in cycles:
-                        cycle_data = data[data['cycle_number'] == cycle]
-                        # Special label for cycle 0 (pre-cycle/rest block)
-                        cycle_label = f'Cycle {cycle} (pre-cycle/rest)' if cycle == 0 else f'Cycle {cycle}'
-                        ax.plot(cycle_data['(Q-Qo)_mAh_g'], cycle_data['voltage_V'], 
-                               label=cycle_label, linewidth=1.5)
-                    ax.set_xlabel('Capacity (Q-Qo) (mAh/g)', fontsize=12)
-                    ax.set_ylabel('Voltage (V)', fontsize=12)
-                    ax.legend()
-                
-                elif analysis_type == "Cycling vs. Endpointslippage":
-                    ax.plot(data['cycle_number'], data['discharge_endpoint'], 'o-', label='Discharge Endpoint', linewidth=2)
-                    ax.plot(data['cycle_number'], data['charge_endpoint'], 's-', label='Charge Endpoint', linewidth=2)
-                    ax.set_xlabel('Cycle Number', fontsize=12)
-                    ax.set_ylabel('Endpoint Slippage', fontsize=12)
-                    ax.legend()
-                
+                    copied.columns = ["Time (h)", "Voltage (V)"]
                 elif analysis_type == "dQ/dV":
-                    for cycle in cycles:
-                        charge_data = data[(data['cycle_number'] == cycle) & (data['type'] == 'charge')]
-                        discharge_data = data[(data['cycle_number'] == cycle) & (data['type'] == 'discharge')]
-                        # Special label for cycle 0 (pre-cycle/rest block)
-                        cycle_label = f'Cycle {cycle} (pre-cycle/rest)' if cycle == 0 else f'Cycle {cycle}'
-                        if len(charge_data) > 0:
-                            ax.plot(charge_data['voltage_V'], charge_data['dQdV_charge'], 'o-', 
-                                   label=f'{cycle_label} Charge', linewidth=1.5, alpha=0.7)
-                        if len(discharge_data) > 0:
-                            ax.plot(discharge_data['voltage_V'], discharge_data['dQdV_discharge'], 's-', 
-                                   label=f'{cycle_label} Discharge', linewidth=1.5, alpha=0.7)
-                    ax.set_xlabel('Voltage (V)', fontsize=12)
-                    ax.set_ylabel('dQ/dV', fontsize=12)
-                    ax.legend(fontsize=8)
-                
-                elif analysis_type == "dV/dQ":
-                    for cycle in cycles:
-                        cycle_data = data[data['cycle_number'] == cycle]
-                        # Special label for cycle 0 (pre-cycle/rest block)
-                        cycle_label = f'Cycle {cycle} (pre-cycle/rest)' if cycle == 0 else f'Cycle {cycle}'
-                        ax.plot(cycle_data['discharge_cap_mAh_g'], cycle_data['dVdQ'], 
-                               label=cycle_label, linewidth=1.5)
-                    ax.set_xlabel('Discharge Capacity (mAh/g)', fontsize=12)
-                    ax.set_ylabel('dV/dQ', fontsize=12)
-                    ax.legend()
-                
-                ax.set_title(f'{analysis_type} - Cell {self.cell_id}', fontsize=14)
-                ax.grid(True, alpha=0.3)
-                logger.debug(f"Plot created successfully for {analysis_type}")
-                
-            except Exception as e:
-                logger.error(f"Error plotting {analysis_type}: {e}", exc_info=True)
-                ax.text(0.5, 0.5, f'Error plotting:\n{str(e)}', 
-                       ha='center', va='center', transform=ax.transAxes)
-            
-            preview_window.canvas.draw()
-            preview_window.exec()
-        except Exception as e:
-            logger.error(f"Error in show_plot: {e}", exc_info=True)
-
-
-class PlotPreviewWindow(QDialog):
-    """Popup window to display matplotlib plots"""
-    def __init__(self, parent=None, cell_id=None, title="Plot Preview"):
-        super().__init__(parent)
-        self.setWindowTitle(f"{title} - Cell {cell_id}")
-        self.resize(820, 600)
-        
-        layout = QVBoxLayout()
-        self.setLayout(layout)
-        
-        # Create matplotlib figure
-        self.figure = Figure(figsize=(8, 6))
-        self.canvas = FigureCanvas(self.figure)
-        layout.addWidget(self.canvas)
-        
-        # Close button
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.close)
-        layout.addWidget(close_btn)
+                    cell_label = f"{cell_id}_{'_'.join(map(str, cycles))}"
+                header = "\t".join(copied.columns)
+                rows = copied.to_csv(sep="\t", index=False, header=False)
+                text = f"{header}\n\n{cell_label}\n{rows}"
+            QApplication.clipboard().setText(text)
+        except Exception as error:
+            logger.exception("Could not copy %s plot data", analysis_type)
+            self.feedback.setText(f"Could not copy plotted data. {error}")
+        else:
+            self.feedback.setText(f"Copied {len(copied):,} rows from {len(results)} battery data set(s).")
