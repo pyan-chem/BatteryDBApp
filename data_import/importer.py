@@ -2,7 +2,12 @@ import pandas as pd
 import os
 import sqlite3
 import logging
+from contextlib import closing
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -130,37 +135,25 @@ class DataImporter:
         try:
             # First, try using galvani with mdbtools (if available)
             try:
-                from galvani.res2sqlite import convert_arbin_to_sqlite
-                
+                if shutil.which("mdb-export") is None:
+                    raise RuntimeError("mdbtools is not available (missing mdb-export)")
                 logger.info(f"Reading Arbin file: {file_path}")
-                
-                # Create a temporary SQLite database
-                temp_db_path = Path(file_path).stem + "_temp.sqlite"
-                
-                try:
-                    # Convert Arbin .res file to SQLite
-                    convert_arbin_to_sqlite(file_path, temp_db_path)
-                    
-                    # Read from the SQLite database
-                    with sqlite3.connect(temp_db_path) as db:
+
+                with TemporaryDirectory(prefix="batterydb-arbin-") as temp_dir:
+                    temp_db_path = str(Path(temp_dir) / "arbin.sqlite")
+                    # Galvani writes progress to stdout, which MCP reserves for protocol messages.
+                    result = subprocess.run(
+                        [sys.executable, "-X", "utf8", "-m", "galvani.res2sqlite", str(file_path), temp_db_path],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                        encoding="utf-8", errors="replace",
+                    )
+                    if result.returncode:
+                        raise RuntimeError(result.stderr.strip() or f"Galvani exited with status {result.returncode}")
+                    with closing(sqlite3.connect(temp_db_path)) as db:
                         df = pd.read_sql(sql="SELECT * FROM Channel_Normal_Table", con=db)
-                    
                     logger.info(f"Successfully loaded {len(df)} rows from {file_path}")
                     return df
-                    
-                finally:
-                    # Always clean up temporary database (even on error)
-                    if os.path.exists(temp_db_path):
-                        try:
-                            os.remove(temp_db_path)
-                            logger.debug(f"Cleaned up temp file: {temp_db_path}")
-                        except OSError as cleanup_error:
-                            logger.warning(f"Failed to clean up temp file '{temp_db_path}': {cleanup_error}")
-                    
-            except ImportError:
-                # galvani not available, use pyodbc fallback
-                logger.info("galvani not available, attempting pyodbc fallback...")
-                return DataImporter._read_arbin_pyodbc(file_path)
+
             except Exception as galvani_error:
                 # If galvani fails, try pyodbc fallback
                 logger.warning(f"Galvani import failed for '{file_path}': {str(galvani_error)}, attempting pyodbc fallback...")
@@ -178,26 +171,18 @@ class DataImporter:
             
             logger.info(f"Reading Arbin file via pyodbc: {file_path}")
             
-            # Create ODBC connection string for MDB file
-            connection_string = f'Driver={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={file_path};'
-            
+            if ";" in str(file_path):
+                raise ValueError("Arbin paths containing semicolons require the mdbtools reader.")
+            connection_string = f"Driver={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={file_path};"
+
             try:
-                # Connect to the MDB file
-                logger.debug(f"Establishing pyodbc connection to: {file_path}")
-                conn = pyodbc.connect(connection_string)
-                cursor = conn.cursor()
-                
-                # Read the data table using cursor to avoid SQLAlchemy warning
-                logger.debug("Fetching data from Channel_Normal_Table")
-                cursor.execute("SELECT * FROM Channel_Normal_Table")
-                columns = [description[0] for description in cursor.description]
-                # Convert pyodbc Row objects to tuples for proper DataFrame construction
-                rows = [tuple(row) for row in cursor.fetchall()]
+                with closing(pyodbc.connect(connection_string, readonly=True)) as conn:
+                    cursor = conn.cursor()
+                    logger.debug("Fetching data from Channel_Normal_Table")
+                    cursor.execute("SELECT * FROM Channel_Normal_Table")
+                    columns = [description[0] for description in cursor.description]
+                    rows = [tuple(row) for row in cursor.fetchall()]
                 df = pd.DataFrame(rows, columns=columns)
-                
-                conn.close()
-                logger.debug(f"Connection closed successfully")
-                
                 logger.info(f"Successfully loaded {len(df)} rows from {file_path}")
                 return df
                 

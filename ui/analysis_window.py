@@ -1,7 +1,6 @@
 import logging
 import re
 from bisect import bisect_left, bisect_right
-from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -16,65 +15,13 @@ from PySide6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 
-from analysis.data_processor import DataProcessor
+from analysis.plot_data import PLOTS, analyze_plot
 from ui.point_inspector import PointInspector
 
 
 logger = logging.getLogger(__name__)
 MAX_ANALYSIS_BATTERIES = 10
 SAMPLE_COLORS = colormaps["tab10"].colors
-
-
-@dataclass(frozen=True)
-class PlotDefinition:
-    x: str
-    x_label: str
-    y_label: str
-    series: tuple
-    export_columns: tuple
-    processor: object = None
-    per_cycle: bool = False
-
-
-PLOTS = {
-    "Voltage vs. Time": PlotDefinition(
-        "time_h", "Time (h)", "Voltage (V)", (("voltage_V", "Voltage"),),
-        ("time_h", "voltage_V"), per_cycle=True,
-    ),
-    "Cycling vs. Capacity": PlotDefinition(
-        "cycle_number", "Cycle number", "Capacity (mAh/g)",
-        (("charge_cap_mAh_g", "Charge"), ("discharge_cap_mAh_g", "Discharge")),
-        ("cycle_number", "charge_cap_mAh_g", "discharge_cap_mAh_g"), DataProcessor.cycling_vs_capacity,
-    ),
-    "Cycling vs. Accumulated Energy": PlotDefinition(
-        "cycle_number", "Cycle number", "Accumulated energy (Wh)", (("Accu_Energy_Wh", "Energy"),),
-        ("cycle_number", "Accu_Energy_Wh"), DataProcessor.cycling_vs_accumulated_energy,
-    ),
-    "dQ/dV": PlotDefinition(
-        "voltage_V", "Voltage (V)", "dQ/dV (mAh/g/V)",
-        (("dQdV_charge", "Charge"), ("dQdV_discharge", "Discharge")),
-        ("voltage_V", "dQdV_charge", "dQdV_discharge"), per_cycle=True,
-    ),
-    "dV/dQ": PlotDefinition(
-        "discharge_cap_mAh_g", "Discharge capacity (mAh/g)", "dV/dQ (V g/mAh)",
-        (("dVdQ", "Discharge"),), ("cycle_number", "discharge_cap_mAh_g", "dVdQ"),
-        DataProcessor.dvdq, per_cycle=True,
-    ),
-    "Voltage vs. Capacity cyclic": PlotDefinition(
-        "(Q-Qo)_mAh_g", "Capacity (Q − Q₀) (mAh/g)", "Voltage (V)", (("voltage_V", "Voltage"),),
-        ("cycle_number", "voltage_V", "(Q-Qo)_mAh_g"), DataProcessor.voltage_vs_capacity_cyclic,
-        per_cycle=True,
-    ),
-    "Cycling vs. Overvoltage": PlotDefinition(
-        "cycle_number", "Cycle number", "Overvoltage (V)", (("Overvoltage", "Overvoltage"),),
-        ("cycle_number", "Overvoltage"), DataProcessor.cycling_vs_overvoltage,
-    ),
-    "Cycling vs. Endpointslippage": PlotDefinition(
-        "cycle_number", "Cycle number", "Endpoint slippage (mAh/g)",
-        (("discharge_endpoint", "Discharge"), ("charge_endpoint", "Charge")),
-        ("cycle_number", "discharge_endpoint", "charge_endpoint"), DataProcessor.cycling_vs_endpointslippage,
-    ),
-}
 
 
 class AnalysisWindow(QWidget):
@@ -509,17 +456,8 @@ class AnalysisWindow(QWidget):
         self.feedback.setToolTip("\n".join(summaries))
 
     def _analyze(self, sample, cycles, analysis_type, definition):
-        selected = sample[sample["cycle_number"].isin(cycles)]
-        if selected.empty:
-            return selected
-        if analysis_type == "dQ/dV":
-            return DataProcessor.dqdv(
-                selected, interpolate_flag=self.interp_chk.isChecked(), interp_points=self.interp_points_input.value()
-            )
-        if definition.processor:
-            data = definition.processor(sample)
-            return data[data["cycle_number"].isin(cycles)]
-        return selected
+        interpolation_points = self.interp_points_input.value() if self.interp_chk.isChecked() else None
+        return analyze_plot(sample, cycles, analysis_type, definition, interpolation_points=interpolation_points)
 
     @staticmethod
     def _draw_sample(axes, data, cell_id, analysis_type, definition, color, comparison):

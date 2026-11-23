@@ -17,9 +17,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from analysis.data_processor import DataProcessor
+from analysis.data_loading import load_and_process_cell
 from data_import.file_status import FILE_STOPPED, FILE_UPDATED, FileStatusScan
-from data_import.importer import DataImporter
 from database import BatteryDatabase
 from ui.analysis_window import AnalysisWindow, MAX_ANALYSIS_BATTERIES
 
@@ -803,93 +802,10 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "About Battery Data Manager", "Manage, analyze and plot battery test data.")
 
     def _load_and_process_cell(self, file_path, instrument_type, p_active_mass):
-        """
-        Unified data loading and processing pipeline.
-        
-        Args:
-            file_path: Path to raw data file
-            instrument_type: "Biologic", "Arbin", or "Maccor"
-            p_active_mass: Positive electrode active mass in grams
-        
-        Returns:
-            Processed DataFrame
-        
-        Raises:
-            ValueError: If inputs invalid
-            Exception: If data loading/processing fails
-        """
         try:
-            logger.debug(f"Loading and processing {instrument_type} data: {file_path}, p_active_mass={p_active_mass}")
-            
-            if p_active_mass <= 0:
-                logger.error(f"Invalid p_active_mass: {p_active_mass}")
-                raise ValueError("P active mass must be greater than 0")
-            
-            # Import data
-            logger.debug(f"Importing data from {file_path}")
-            import_start = time.perf_counter()
-            df = DataImporter.import_data(file_path, instrument_type)
-            import_elapsed = time.perf_counter() - import_start
-            imported_rows = len(df)
-            logger.info(
-                f"import_data completed in {import_elapsed:.3f}s for {file_path} ({imported_rows} rows)"
-            )
-            
-            # Basic data cleaning
-            clean_start = time.perf_counter()
-            df_cleaned = self.clean_data(df)
-            clean_elapsed = time.perf_counter() - clean_start
-            cleaned_rows = len(df_cleaned)
-            logger.info(
-                f"clean_data completed in {clean_elapsed:.3f}s for {file_path} ({imported_rows} -> {cleaned_rows} rows)"
-            )
-            
-            # Process data based on instrument type
-            processor_map = {
-                "Biologic": DataProcessor.process_biologic_data,
-                "Arbin": DataProcessor.process_arbin_data,
-                "Maccor": DataProcessor.process_maccor_data,
-            }
-            
-            if instrument_type not in processor_map:
-                logger.error(f"Unknown instrument type: {instrument_type}")
-                raise ValueError(f"Unknown instrument type: {instrument_type}")
-            
-            logger.debug(f"Processing data with {instrument_type} processor")
-            process_start = time.perf_counter()
-            processed = processor_map[instrument_type](df_cleaned, p_active_mass)
-            process_elapsed = time.perf_counter() - process_start
-            processed_rows = len(processed)
-            logger.info(
-                f"process_{instrument_type.lower()}_data completed in {process_elapsed:.3f}s for {file_path} ({cleaned_rows} -> {processed_rows} rows)"
-            )
-            return processed
-        except Exception as e:
-            logger.error(f"Error in data loading/processing pipeline: {e}", exc_info=True)
-            raise
-
-    def clean_data(self, df):
-        """Clean battery data - remove rows with invalid values, etc."""
-        try:
-            df_clean = df.copy()
-            
-            original_rows = len(df_clean)
-            
-            # Remove rows where all values are 0 or NaN
-            df_clean = df_clean.dropna(how='all')
-            
-            # Remove duplicate rows
-            df_clean = df_clean.drop_duplicates()
-            
-            # Reset index
-            df_clean = df_clean.reset_index(drop=True)
-            
-            final_rows = len(df_clean)
-            removed_rows = original_rows - final_rows
-            logger.info(f"Data cleaned: {original_rows} -> {final_rows} rows (removed {removed_rows} rows)")
-            return df_clean
-        except Exception as e:
-            logger.error(f"Error during data cleaning: {e}", exc_info=True)
+            return load_and_process_cell(file_path, instrument_type, p_active_mass)
+        except Exception:
+            logger.exception("Error in data loading/processing pipeline for %s", file_path)
             raise
 
 
