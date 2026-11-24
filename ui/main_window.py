@@ -47,26 +47,50 @@ DETAIL_FIELDS = (
     ("file_path", "Data file"), ("comment", "Notes"),
 )
 
-WINDOW_STYLE = """
-QLabel#pageTitle { font-size: 24px; font-weight: 650; }
-QLabel#detailTitle { font-size: 19px; font-weight: 650; }
-QFrame#detailPanel, QFrame#analysisControls {
-    background: palette(base); border: 1px solid palette(mid); border-radius: 8px;
-}
-QScrollArea#detailScroll, QWidget#detailContents { background: palette(base); }
-QTableWidget { border: 1px solid palette(mid); }
-QHeaderView::section { padding: 7px 8px; }
-QLineEdit, QComboBox { min-height: 25px; }
-QPushButton { padding: 5px 10px; }
-QPushButton[primary="true"] {
-    background: #146b69; border: 1px solid #146b69; border-radius: 5px;
-    color: white; font-weight: 600;
-}
-QPushButton[primary="true"]:hover { background: #0e5b59; }
-QPushButton[primary="true"]:focus { border: 2px solid palette(highlight); }
-QPushButton[primary="true"]:disabled {
-    color: palette(mid); border: 1px solid palette(mid); background: palette(button);
-}
+# Hallmark 2.0.0 | native Qt app | library and analysis | focused redesign
+# Pre-emit review: P4 H4 E4 S4 R5 V3 | put cycle actions beside the measured curves.
+ACCENT = "#146b69"
+ACCENT_HOVER = "#0e5b59"
+ACCENT_PRESSED = "#0a4947"
+ON_ACCENT = "#ffffff"
+FOCUS = "#24619c"
+
+WINDOW_STYLE = f"""
+QLabel#pageTitle {{ font-size: 21px; font-weight: 650; }}
+QLabel#detailTitle {{ font-size: 17px; font-weight: 650; }}
+QFrame#detailPanel, QFrame#analysisControls {{
+    background: palette(base); border: 1px solid palette(mid); border-radius: 5px;
+}}
+QScrollArea#detailScroll, QWidget#detailContents, QFrame#plotActions {{
+    background: palette(base);
+}}
+QFrame#plotActions {{ border-top: 1px solid palette(mid); }}
+QTableWidget {{ border: 1px solid palette(mid); }}
+QTableWidget, QListWidget {{
+    selection-background-color: {ACCENT}; selection-color: {ON_ACCENT};
+}}
+QTableWidget::item, QListWidget::item {{ padding-left: 5px; }}
+QListWidget::item {{ min-height: 20px; }}
+QHeaderView::section {{ padding: 7px 8px; }}
+QLineEdit, QComboBox, QSpinBox {{ min-height: 27px; }}
+QPushButton {{
+    min-height: 30px; padding: 0 10px; border: 2px solid palette(mid);
+    border-radius: 4px; background: palette(button);
+}}
+QPushButton:hover:enabled {{ background: palette(alternate-base); }}
+QPushButton:pressed {{ background: palette(midlight); }}
+QPushButton:disabled {{ color: palette(mid); }}
+QPushButton[primary="true"] {{
+    background: {ACCENT}; border-color: {ACCENT}; color: {ON_ACCENT}; font-weight: 600;
+}}
+QPushButton[primary="true"]:hover:enabled {{ background: {ACCENT_HOVER}; }}
+QPushButton[primary="true"]:pressed {{ background: {ACCENT_PRESSED}; }}
+QPushButton[primary="true"]:disabled {{
+    color: palette(mid); border-color: palette(mid); background: palette(button);
+}}
+QPushButton:focus, QPushButton[primary="true"]:focus {{ border-color: {FOCUS}; }}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDateEdit:focus, QPlainTextEdit:focus,
+QListWidget:focus, QTableWidget:focus {{ border: 1px solid {FOCUS}; }}
 """
 
 
@@ -169,10 +193,12 @@ class MainWindow(QMainWindow):
         self.table_widget.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table_widget.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table_widget.setAlternatingRowColors(True)
+        self.table_widget.setShowGrid(False)
         self.table_widget.setWordWrap(False)
         self.table_widget.verticalHeader().hide()
         self.table_widget.verticalHeader().setDefaultSectionSize(32)
         header = self.table_widget.horizontalHeader()
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)

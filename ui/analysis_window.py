@@ -64,23 +64,29 @@ class AnalysisWindow(QWidget):
         splitter.setHandleWidth(12)
         layout.addWidget(splitter, 1)
 
-        controls = QFrame()
-        controls.setObjectName("analysisControls")
-        controls.setMinimumWidth(250)
+        sidebar = QFrame()
+        sidebar.setObjectName("analysisControls")
+        sidebar.setMinimumWidth(265)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(0)
+
+        controls = QWidget()
         controls_layout = QVBoxLayout(controls)
-        controls_layout.setContentsMargins(16, 15, 16, 15)
-        controls_layout.setSpacing(8)
+        controls_layout.setContentsMargins(14, 12, 14, 12)
+        controls_layout.setSpacing(7)
         controls_layout.addWidget(self._create_sample_picker())
         type_label = QLabel("&Analysis type")
         self.analysis_type_combo = QComboBox()
         self.analysis_type_combo.addItems(PLOTS.keys())
+        self.analysis_type_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.analysis_type_combo.setMinimumContentsLength(12)
         type_label.setBuddy(self.analysis_type_combo)
         controls_layout.addWidget(type_label)
         controls_layout.addWidget(self.analysis_type_combo)
 
         self.cycle_availability = QLabel()
         self.cycle_availability.setWordWrap(True)
-        controls_layout.addWidget(self.cycle_availability)
         self.all_cycles_chk = QCheckBox("All test cycles")
         self.all_cycles_chk.setChecked(self.available_cycles != [0])
         controls_layout.addWidget(self.all_cycles_chk)
@@ -102,20 +108,33 @@ class AnalysisWindow(QWidget):
         interpolation_layout.addRow(self.interp_chk)
         interpolation_layout.addRow("Points", self.interp_points_input)
         controls_layout.addWidget(self.interpolation_settings)
+        controls_layout.addWidget(self.cycle_availability)
+        controls_layout.addStretch()
 
+        control_scroll = QScrollArea()
+        control_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        control_scroll.setWidgetResizable(True)
+        control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        control_scroll.setWidget(controls)
+        sidebar_layout.addWidget(control_scroll, 1)
+
+        actions = QFrame()
+        actions.setObjectName("plotActions")
+        actions_layout = QVBoxLayout(actions)
+        actions_layout.setContentsMargins(14, 10, 14, 12)
+        actions_layout.setSpacing(6)
+        sidebar_layout.addWidget(actions)
         self.preview_btn = QPushButton("Plot selected cycles")
         self.preview_btn.setProperty("primary", True)
         self.preview_btn.clicked.connect(self.data_preview)
         self.extract_btn = QPushButton("Copy plotted data")
         self.extract_btn.clicked.connect(self.extract_data)
-        controls_layout.addWidget(self.preview_btn)
-        controls_layout.addWidget(self.extract_btn)
+        actions_layout.addWidget(self.preview_btn)
+        actions_layout.addWidget(self.extract_btn)
         self.feedback = QLabel()
         self.feedback.setTextFormat(Qt.TextFormat.PlainText)
         self.feedback.setWordWrap(True)
         self.feedback.setAccessibleName("Analysis status")
-        controls_layout.addWidget(self.feedback)
-        controls_layout.addStretch()
 
         chart_panel = QWidget()
         chart_layout = QVBoxLayout(chart_panel)
@@ -130,13 +149,8 @@ class AnalysisWindow(QWidget):
         self.point_inspector = PointInspector(self.canvas)
         chart_layout.addWidget(self.toolbar)
         chart_layout.addWidget(self.canvas, 1)
-        control_scroll = QScrollArea()
-        control_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        control_scroll.setWidgetResizable(True)
-        control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        control_scroll.setMinimumWidth(265)
-        control_scroll.setWidget(controls)
-        splitter.addWidget(control_scroll)
+        chart_layout.addWidget(self.feedback)
+        splitter.addWidget(sidebar)
         splitter.addWidget(chart_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -165,7 +179,7 @@ class AnalysisWindow(QWidget):
         self.sample_list.setAccessibleName("Batteries to analyze")
         self.sample_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.sample_list.setMinimumHeight(90)
-        self.sample_list.setMaximumHeight(128)
+        self.sample_list.setMaximumHeight(110)
         label.setBuddy(self.sample_list)
         self.sample_status = QLabel()
         self.sample_status.setWordWrap(True)
@@ -280,16 +294,16 @@ class AnalysisWindow(QWidget):
     def _update_sample_info(self):
         count = len(self.selected_battery_ids)
         if count == 1:
-            self.title.setText(f"Analysis · {self.selected_battery_ids[0]}")
+            self.title.setText(f"Analysis: {self.selected_battery_ids[0]}")
         elif count:
-            self.title.setText(f"Analysis · {count} batteries")
+            self.title.setText(f"Analysis: {count} batteries")
         else:
             self.title.setText("Analysis")
         self.export_btn.setEnabled(count == 1 and self.selected_battery_ids[0] in self.samples)
         self.export_btn.setToolTip("Select one battery to export its processed CSV." if count != 1 else "")
         message = f"{count} / {MAX_ANALYSIS_BATTERIES} selected"
         if self._pending:
-            message += f" · Loading {self._pending[0]}…"
+            message += f"\nLoading {self._pending[0]}…"
         if self._load_errors:
             cell_id, error = next(iter(self._load_errors.items()))
             message += f"\n{cell_id}: {error}"
@@ -353,7 +367,9 @@ class AnalysisWindow(QWidget):
 
     def update_controls(self):
         self.cycles_input.setEnabled(not self.all_cycles_chk.isChecked())
-        dq_dv_selected = self.analysis_type_combo.currentText() == "dQ/dV"
+        analysis_type = self.analysis_type_combo.currentText()
+        self.analysis_type_combo.setToolTip(analysis_type)
+        dq_dv_selected = analysis_type == "dQ/dV"
         self.interpolation_settings.setVisible(dq_dv_selected)
         self.interp_points_input.setEnabled(self.interp_chk.isChecked())
         available = self.format_cycle_ranges()
@@ -507,8 +523,15 @@ class AnalysisWindow(QWidget):
                     label = name
                     series_color = color if comparison else ("#146b69", "#6557a1")[index]
                     marker = "o"
+                # Preserve lone points at gaps while keeping dense dashed lines legible.
+                markevery = None
+                if marker and valid.sum() > 25:
+                    finite = valid.to_numpy()
+                    left = np.r_[False, finite[:-1]]
+                    right = np.r_[finite[1:], False]
+                    markevery = np.flatnonzero(finite & ~left & ~right).tolist()
                 line, = axes.plot(x, y, color=series_color, linestyle=style, label=label, linewidth=1.4,
-                                  marker=marker, markersize=3)
+                                  marker=marker, markersize=3, markevery=markevery)
                 curves.append((line, f"{cell_id} · {label}"))
         return curves, plotted_cycles
 
