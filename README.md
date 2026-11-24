@@ -1,5 +1,7 @@
 # BatteryDBApp
 
+<img src="assets/batterydbapp-logo.png" alt="BatteryDBApp logo" width="180">
+
 BatteryDBApp is a PySide6 desktop application for organizing battery test records and analyzing cycling data from Arbin, BioLogic, and Maccor instruments. It stores battery metadata and links to the original instrument files in SQLite.
 
 ## Installation
@@ -28,7 +30,7 @@ The default database is `battery_data.db`. Use **File → Open database…** to 
 4. Hover near a plotted point to see its battery ID, X and Y values, and the cycle or charge/discharge branch where applicable. The legend identifies each battery by color. Solid and dashed lines distinguish charge and discharge when both are plotted. The chart toolbar supports zooming, panning, and saving an image.
 5. Use **Copy plotted data** for tab-separated plot data. Comparisons include a `Battery ID` column. Select one battery to use **Export processed CSV…** for its processed instrument data.
 
-Available plots include voltage versus time, voltage versus capacity for selected cycles, capacity versus cycle, overvoltage versus cycle, accumulated discharge energy, cycle-to-cycle endpoint slippage, dQ/dV with optional interpolation, and dV/dQ. Overvoltage is the mean charge voltage minus the mean discharge voltage. The accumulated discharge energy calculation is pending validation.
+Available plots include voltage versus time, voltage versus capacity for selected cycles, capacity versus cycle, average charge–discharge voltage gap versus cycle, cumulative discharge energy, cycle-to-cycle endpoint slippage, dQ/dV with optional interpolation, and dV/dQ. Discharge energy integrates measured power. The voltage gap compares capacity-weighted average charge and discharge voltages. dQ/dV and dV/dQ use constant-current segments. Maccor uses Cycle C when recorded and flags a potentially incomplete final cycle.
 
 ## Read the library from Codex
 
@@ -57,7 +59,7 @@ The database must already exist. Instrument files must be accessible from the co
 
 For all eight plots, BatteryDBApp reads the linked instrument file and calculates the plot data locally using the same code as the desktop analysis view. The MCP server returns the calculated values, axis labels, and series names so Codex can draw the chart when asked. For example, ask Codex to plot the dQ/dV curve for cycle 10 of a specific battery.
 
-For `get_plot_data`, use `capacity`, `overvoltage`, `accumulated_energy`, `endpoint_slippage`, `voltage_time`, `voltage_capacity`, `dqdv`, or `dvdq`. For example, ask Codex to find LFP cells, compare their first 50 cycles of discharge capacity, and retrieve the voltage–capacity points for cycle 10. The accumulated discharge energy calculation is pending validation.
+For `get_plot_data`, use `capacity`, `overvoltage`, `accumulated_energy`, `endpoint_slippage`, `voltage_time`, `voltage_capacity`, `dqdv`, or `dvdq`. For example, ask Codex to find LFP cells, compare their first 50 cycles of discharge capacity, and retrieve the voltage–capacity points for cycle 10. The MCP plot ID `overvoltage` returns the average voltage gap.
 
 Measurement and plot tools accept a list of `cycles` or an inclusive `cycle_start`/`cycle_end` range. Plots omit the initial rest (cycle 0) by default, as in the GUI. Measurements include it by default. For dQ/dV, pass `interpolation_points` to enable the same interpolation as in the app. The number of selected cycles times the requested interpolation points must be at most 100,000 per call. Split large requests across cycle ranges.
 
@@ -84,7 +86,7 @@ The check reads file metadata once per distinct path. Its cost depends mainly on
 | Arbin | `.res` | galvani with mdbtools or a pyodbc fallback with a Microsoft Access ODBC driver |
 | Maccor | `.txt`, `.xyz`, or a numeric extension such as `.001` | Tab-separated text |
 
-Maccor imports detect headers automatically and use fewer columns for faster analysis when the export supports it.
+Maccor imports detect headers automatically and read only the columns needed for analysis when the export supports it.
 
 ## Development
 

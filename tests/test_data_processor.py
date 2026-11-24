@@ -45,11 +45,14 @@ def test_process_maccor_data_basic():
     assert 'current_mA' in processed.columns
     assert processed['current_mA'].iloc[0] > 0
     assert processed['charge_cap_mAh_g'].sum() >= 0
+
+
 def test_maccor_trajectory_keeps_cycle_endpoints_and_writes_in_bulk(monkeypatch):
     frame = pd.DataFrame(
         {
             "Echem_Test_Time_h": [0, 2, 1, 4, 3, 3.5, 6, 5, 7, 8],
-            "Echem_Cycle": [1, 1, 1, 1, 1, 1, 2, 2, 3, 4],
+            "Echem_Cycle": [9] * 10,
+            "Echem_Cycle_C": [1, 1, 1, 1, 1, 1, 2, 2, 3, 4],
             "Echem_Mode": ["R", "C", "C", "D", "D", "R", "C", "C", "D", "C"],
             "Echem_Capacity_Ah": [0, .004, .002, .003, .001, None, None, .002, .001, .001],
             "Echem_Current_A": [0, .001, .001, .001, .001, 0, .001, .001, .001, .001],
@@ -73,6 +76,8 @@ def test_maccor_trajectory_keeps_cycle_endpoints_and_writes_in_bulk(monkeypatch)
     assert result.index.tolist() == [10, 14, 11, 20, 25, 18, 43, 31, 52, 60]
     assert result["cycle_number"].tolist() == [0, 1, 1, 1, 1, 1, 2, 2, 3, 4]
     assert result["(Q-Qo)_mAh_g"].tolist() == [0, 2, 4, 3, 0, 1, 3, 1, 2, 3]
+    assert result.attrs["cycle_number_source"] == "Cycle C"
+    assert result.attrs["last_cycle_status"] == "incomplete"
     assert trajectory_writes == []
 
 

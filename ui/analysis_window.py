@@ -357,7 +357,19 @@ class AnalysisWindow(QWidget):
         self.interpolation_settings.setVisible(dq_dv_selected)
         self.interp_points_input.setEnabled(self.interp_chk.isChecked())
         available = self.format_cycle_ranges()
-        self.cycle_availability.setText(f"Available cycles: {available}" if available else "No cycles loaded.")
+        cycle_notes = [f"Available cycles: {available}" if available else "No cycles loaded."]
+        inferred = [cell_id for cell_id, frame in self.samples.items()
+                    if frame.attrs.get("cycle_number_source") == "inferred"]
+        if inferred:
+            suffix = f" ({', '.join(inferred)})" if len(self.samples) > 1 else ""
+            cycle_notes.append(f"Cycle C inferred from charge/discharge{suffix}.")
+        for cell_id, frame in self.samples.items():
+            status = frame.attrs.get("last_cycle_status")
+            if status in {"incomplete", "unconfirmed"}:
+                message = "incomplete" if status == "incomplete" else "completion unconfirmed"
+                prefix = f"{cell_id}: " if len(self.samples) > 1 else ""
+                cycle_notes.append(f"{prefix}Last cycle {frame.attrs['last_cycle_number']}: {message}.")
+        self.cycle_availability.setText("\n".join(cycle_notes))
         self.zero_note.setVisible(0 in self.available_cycles)
         cycles, notice = self._read_cycle_selection()
         self.preview_btn.setEnabled(cycles is not None)
@@ -452,6 +464,8 @@ class AnalysisWindow(QWidget):
             summaries.extend(f"{key}: {value}" for key, value in issues.items())
         if notice:
             message += f"\n{notice}"
+        if any("cc_source" in frame and frame["cc_source"].eq("inferred").any() for frame in results.values()):
+            message += "\nCC intervals inferred from current and voltage measurements."
         self.feedback.setText(message)
         self.feedback.setToolTip("\n".join(summaries))
 
@@ -463,8 +477,14 @@ class AnalysisWindow(QWidget):
     def _draw_sample(axes, data, cell_id, analysis_type, definition, color, comparison):
         curves = []
         plotted_cycles = set()
-        groups = data.groupby("cycle_number") if definition.per_cycle else [(None, data)]
+        separated = definition.per_cycle and "segment" in data
+        keys = ["cycle_number", "segment"] if separated else "cycle_number"
+        groups = data.groupby(keys) if definition.per_cycle else [(None, data)]
+        cycle_colors = {}
         for group_index, (cycle, block) in enumerate(groups):
+            if separated:
+                cycle = cycle[0]
+                group_index = cycle_colors.setdefault(cycle, len(cycle_colors))
             for index, (column, name) in enumerate(definition.series):
                 if column not in block:
                     continue
@@ -479,6 +499,8 @@ class AnalysisWindow(QWidget):
                     label = "Cycle 0 (rest)" if cycle == 0 else f"Cycle {cycle}"
                     if len(definition.series) > 1:
                         label = f"{label} · {name}"
+                    if separated and series["cc_source"].iat[0] == "inferred":
+                        label += " · CC inferred"
                     series_color = color if comparison else SAMPLE_COLORS[group_index % len(SAMPLE_COLORS)]
                     marker = "o" if valid.sum() == 1 else None
                 else:

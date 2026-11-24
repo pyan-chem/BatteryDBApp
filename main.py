@@ -1,5 +1,8 @@
 import sys
 import logging
+from pathlib import Path
+
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 from ui.main_window import MainWindow
 
@@ -41,6 +44,7 @@ def main():
     
     try:
         app = QApplication(sys.argv)
+        app.setWindowIcon(QIcon(str(Path(__file__).resolve().parent / "assets" / "batterydbapp-logo.png")))
         logger.info("Qt Application created successfully")
         
         # Load stylesheet if needed

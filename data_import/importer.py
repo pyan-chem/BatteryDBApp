@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 class DataImporter:
     MACCOR_ANALYSIS_COLUMNS = {
-        "Echem_Rec#", "Echem_Test_Time_h", "Echem_Cycle", "Echem_Capacity_Ah",
+        "Echem_Rec#", "Echem_Test_Time_h", "Echem_Capacity_Ah",
         "Echem_Energy_Wh", "Echem_Current_A", "Echem_Voltage_V", "Echem_Mode",
     }
 
@@ -49,7 +49,7 @@ class DataImporter:
             if ext != ".mpr":
                 logger.error(f"Invalid Biologic file format: {file_path} (expected .mpr, got {ext})")
                 raise ValueError(f"Biologic files must be .mpr format, got {ext}")
-            return DataImporter._read_biologic(file_path)
+            return DataImporter._read_biologic(file_path, for_analysis=for_analysis)
         elif instrument_type == "Maccor":
             # Support .txt, .xyz, and numeric extensions (.001, .002, etc.)
             if ext not in [".txt", ".xyz"] and not (ext.startswith(".") and ext[1:].isdigit()):
@@ -61,7 +61,7 @@ class DataImporter:
             raise ValueError(f"Unknown instrument type: {instrument_type}")
 
     @staticmethod
-    def _read_biologic(file_path):
+    def _read_biologic(file_path, *, for_analysis=False):
         """Read Biologic .mpr files using yadg first, then fallback to galvani."""
         required_columns = [
             'time/s',
@@ -75,7 +75,7 @@ class DataImporter:
 
         logger.info(f"Reading Biologic file with yadg: {file_path}")
         try:
-            yadg_df = DataImporter._read_biologic_yadg(file_path)
+            yadg_df = DataImporter._read_biologic_yadg(file_path, for_analysis=for_analysis)
             missing = [col for col in required_columns if col not in yadg_df.columns]
             if not missing:
                 logger.info(f"yadg Biologic import succeeded: {len(yadg_df)} rows")
@@ -94,6 +94,8 @@ class DataImporter:
             
             # Convert the data to a DataFrame
             df = pd.DataFrame(mpr_file.data)
+            if for_analysis and "mode" in mpr_file.flags_dict:
+                df["mode"] = mpr_file.get_flag("mode")
             
             logger.info(f"Successfully loaded {len(df)} rows from {file_path}")
             return df
@@ -109,7 +111,7 @@ class DataImporter:
             raise Exception(f"Error reading Biologic file: {str(e)}")
 
     @staticmethod
-    def _read_biologic_yadg(file_path):
+    def _read_biologic_yadg(file_path, *, for_analysis=False):
         """Read Biologic .mpr files using yadg and map fields to legacy DataProcessor columns."""
         from yadg.extractors import extract
 
@@ -126,6 +128,8 @@ class DataImporter:
             '(Q-Qo)/mA.h': '(Q-Qo)',
             '|Energy|/W.h': 'Energy we',
         }
+        if for_analysis:
+            variable_mapping.update({"mode": "mode", "Ns": "Ns"})
 
         for target_col, source_var in variable_mapping.items():
             if source_var in dataset:
@@ -244,6 +248,7 @@ class DataImporter:
                 # Cycle columns
                 'Echem_Cycle P': 'Echem_Cycle',
                 'Echem_Cyc#': 'Echem_Cycle',
+                'Echem_Cycle C': 'Echem_Cycle_C',
                 
                 # Mode columns
                 'Echem_MD': 'Echem_Mode',
@@ -336,6 +341,9 @@ class DataImporter:
         positions = [index for index, name in enumerate(mapped) if name in required]
         if len(positions) != len(required) or {mapped[index] for index in positions} != required:
             return None
+        optional = ("Echem_Full Step #", "Echem_Step", "Echem_Step_Time_h", "Echem_Cycle_C", "Echem_Status")
+        positions.extend(mapped.index(name) for name in optional if mapped.count(name) == 1)
+        positions.sort()
 
         # pandas can ignore ragged rows with usecols. Keep the original parser for
         # ragged or quoted records, including multiline fields.
@@ -356,7 +364,7 @@ class DataImporter:
             return None
         selected_names = ['Echem_' + name.strip() for name in frame.columns]
         selected_mapped = [column_mapping.get(name, name) for name in selected_names]
-        if set(selected_mapped) != required:
+        if selected_mapped != [mapped[index] for index in positions]:
             return None
         record_ids = frame.iloc[:, selected_mapped.index("Echem_Rec#")]
         if record_ids.hasnans or not record_ids.is_unique:

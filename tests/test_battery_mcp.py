@@ -87,7 +87,7 @@ def test_codex_can_read_battery_records_metrics_and_points(library):
             cases = {
                 "capacity": ("discharge_cap_mAh_g", 80.0),
                 "overvoltage": ("Overvoltage", 0.1),
-                "accumulated_energy": ("Accu_Energy_Wh", 0.003),
+                "accumulated_energy": ("Accu_Energy_Wh", 0.002 * (3.4 + 3.0) / 2 / 3600),
                 "endpoint_slippage": ("charge_endpoint", 100.0),
                 "voltage_time": ("voltage_V", 3.1),
                 "voltage_capacity": ("(Q-Qo)_mAh_g", 0.0),

@@ -1,7 +1,9 @@
 import pandas as pd
 import numpy as np
 import logging
-from scipy import interpolate
+from analysis.cycling_metrics import average_voltage_gap, cumulative_discharge_energy
+from analysis.incremental_capacity import classify_cc, derivative_curves
+from analysis.maccor_cycles import assign_maccor_cycles
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -78,13 +80,6 @@ class DataProcessor:
                 processed_data['(Q-Qo)_mAh_g'] = 0
                 logger.warning("Column '(Q-Qo)/mA.h' not found in Biologic data, using default")
             
-            # Accu_Energy_Wh: |Energy|/W.h (NOT corrected to accumulated discharge energy)
-            if '|Energy|/W.h' in df.columns:
-                processed_data['Accu_Energy_Wh'] = df['|Energy|/W.h']
-            else:
-                processed_data['Accu_Energy_Wh'] = 0.0
-                logger.warning("Column '|Energy|/W.h' not found in Biologic data, using default")
-            
             # Process Q charge/discharge with special logic
             if 'Q charge/discharge/mA.h' in df.columns and p_active_mass > 0:
                 q_charge_discharge = df['Q charge/discharge/mA.h'] / p_active_mass
@@ -120,8 +115,9 @@ class DataProcessor:
             column_order = ['time_h', 'cycle_number', 'current_mA', 'voltage_V', 
                            'charge_cap_mAh_g', 'discharge_cap_mAh_g', 
                            '(Q-Qo)_mAh_g', 'Accu_Energy_Wh']
-            processed_data = processed_data[column_order]
-            
+            processed_data["Accu_Energy_Wh"] = cumulative_discharge_energy(processed_data)
+            processed_data["cc_segment"], processed_data["cc_recorded"] = classify_cc(processed_data, df, "Biologic")
+            processed_data = processed_data[column_order + ["cc_segment", "cc_recorded"]]
             logger.info(f"Successfully processed Biologic data: {len(processed_data)} rows, {len(processed_data['cycle_number'].unique())} cycles")
             return processed_data
         except Exception as e:
@@ -205,19 +201,13 @@ class DataProcessor:
                 processed_data['(Q-Qo)_mAh_g'] = 0.0
                 logger.warning(f"Invalid p_active_mass={p_active_mass} for Arbin data normalization")
             
-            # Accu_Energy_Wh: Charge_Energy - Discharge_Energy (NOT corrected to accumulated discharge energy)
-            if 'Charge_Energy' in df.columns and 'Discharge_Energy' in df.columns:
-                processed_data['Accu_Energy_Wh'] = df['Charge_Energy'] - df['Discharge_Energy']
-            else:
-                processed_data['Accu_Energy_Wh'] = 0.0
-                logger.warning("Energy columns not found in Arbin data")
-            
             # Reorder columns to match standard format
             column_order = ['time_h', 'cycle_number', 'current_mA', 'voltage_V', 
                            'charge_cap_mAh_g', 'discharge_cap_mAh_g', 
                            '(Q-Qo)_mAh_g', 'Accu_Energy_Wh']
-            processed_data = processed_data[column_order]
-            
+            processed_data["Accu_Energy_Wh"] = cumulative_discharge_energy(processed_data)
+            processed_data["cc_segment"], processed_data["cc_recorded"] = classify_cc(processed_data, df, "Arbin")
+            processed_data = processed_data[column_order + ["cc_segment", "cc_recorded"]]
             logger.info(f"Successfully processed Arbin data: {len(processed_data)} rows, {len(processed_data['cycle_number'].unique())} cycles")
             return processed_data
         except Exception as e:
@@ -235,28 +225,14 @@ class DataProcessor:
     
     @staticmethod
     def cycling_vs_accumulated_energy(df):
-        """Cycling vs. Accumulated Discharge Energy: cycle_number, Accu_Energy_Wh (max per cycle)"""
-        result = df.groupby('cycle_number').agg({
-            'Accu_Energy_Wh': 'max'
-        }).reset_index()
-        return result
-    
+        """Return cumulative discharge energy at the end of each cycle."""
+        return df.groupby("cycle_number", as_index=False)["Accu_Energy_Wh"].last()
+
     @staticmethod
     def cycling_vs_overvoltage(df):
-        """Cycling vs. Overvoltage: calculate average voltages and overvoltage per cycle"""
-        # OPTIMIZATION: Replaced explicit loop with vectorized groupby.apply()
-        # Performance: ~3-5x faster. Numerically identical outputs.
-        def calc_overvoltage(group):
-            charge_mask = group['current_mA'] > 0
-            discharge_mask = group['current_mA'] < 0
-            charge_ave = group[charge_mask]['voltage_V'].mean() if charge_mask.any() else 0
-            discharge_ave = group[discharge_mask]['voltage_V'].mean() if discharge_mask.any() else 0
-            return charge_ave - discharge_ave
-        
-        result = df.groupby('cycle_number').apply(calc_overvoltage).reset_index()
-        result.columns = ['cycle_number', 'Overvoltage']
-        return result
-    
+        """Return the difference between charge- and discharge-weighted average cell voltages."""
+        return average_voltage_gap(df)
+
     @staticmethod
     def voltage_vs_capacity_cyclic(df):
         """Voltage vs. Capacity cyclic: cycle_number, voltage_V, (Q-Qo)_mAh_g"""
@@ -296,87 +272,14 @@ class DataProcessor:
     
     @staticmethod
     def dqdv(df, interpolate_flag=False, interp_points=1000):
-        """dQ/dV: calculate gradient(charge_cap_mAh_g)/gradient(voltage_V) with optional interpolation"""
-        result = []
-        
-        # Use interpolation when requested
-        use_interp = interpolate_flag
-        
-        for cycle in df['cycle_number'].unique():
-            cycle_data = df[df['cycle_number'] == cycle].reset_index(drop=True)
-            
-            # Charge part
-            charge_data = cycle_data[cycle_data['current_mA'] > 0].reset_index(drop=True)
-            if len(charge_data) > 1:
-                voltage = charge_data['voltage_V'].values
-                capacity = charge_data['charge_cap_mAh_g'].values
-                
-                if use_interp and len(voltage) > 3:
-                    # Create interpolation points
-                    new_points = np.linspace(0, 1, interp_points)
-                    orig_points = np.linspace(0, 1, len(voltage))
-                    
-                    # Perform interpolation
-                    v_interp = interpolate.interp1d(orig_points, voltage, kind='cubic')(new_points)
-                    c_interp = interpolate.interp1d(orig_points, capacity, kind='cubic')(new_points)
-                    
-                    voltage = v_interp
-                    capacity = c_interp
-                
-                dQ_charge = np.gradient(capacity)
-                dV_charge = np.gradient(voltage)
-                # Avoid division by zero
-                dqdv_charge = np.divide(dQ_charge, dV_charge, where=np.abs(dV_charge) > 1e-10, out=np.zeros_like(dQ_charge))
-                for idx, (v, dq) in enumerate(zip(voltage, dqdv_charge)):
-                    result.append({'cycle_number': cycle, 'voltage_V': v, 'dQdV_charge': dq, 'type': 'charge'})
-            
-            # Discharge part
-            discharge_data = cycle_data[cycle_data['current_mA'] < 0].reset_index(drop=True)
-            if len(discharge_data) > 1:
-                voltage = discharge_data['voltage_V'].values
-                capacity = discharge_data['discharge_cap_mAh_g'].values
-                
-                if use_interp and len(voltage) > 3:
-                    # Create interpolation points
-                    new_points = np.linspace(0, 1, interp_points)
-                    orig_points = np.linspace(0, 1, len(voltage))
-                    
-                    # Perform interpolation
-                    v_interp = interpolate.interp1d(orig_points, voltage, kind='cubic')(new_points)
-                    c_interp = interpolate.interp1d(orig_points, capacity, kind='cubic')(new_points)
-                    
-                    voltage = v_interp
-                    capacity = c_interp
-                
-                dQ_discharge = np.gradient(capacity)
-                dV_discharge = np.gradient(voltage)
-                dqdv_discharge = np.divide(dQ_discharge, dV_discharge, where=np.abs(dV_discharge) > 1e-10, out=np.zeros_like(dQ_discharge))
-                for idx, (v, dq) in enumerate(zip(voltage, dqdv_discharge)):
-                    result.append({'cycle_number': cycle, 'voltage_V': v, 'dQdV_discharge': dq, 'type': 'discharge'})
-        
-        result_df = pd.DataFrame(result)
-        return result_df if not result_df.empty else pd.DataFrame(columns=['cycle_number', 'voltage_V', 'dQdV_charge', 'dQdV_discharge', 'type'])
-    
+        """Calculate signed dQ/dV separately in each retained CC segment."""
+        return derivative_curves(df, interpolation_points=interp_points if interpolate_flag else None)
+
     @staticmethod
     def dvdq(df):
-        """dV/dQ: calculate abs(gradient(voltage_V)/gradient(discharge_cap_mAh_g)) for discharge only"""
-        result = []
-        for cycle in df['cycle_number'].unique():
-            cycle_data = df[df['cycle_number'] == cycle].reset_index(drop=True)
-            
-            # Discharge part only
-            discharge_data = cycle_data[cycle_data['current_mA'] < 0].reset_index(drop=True)
-            if len(discharge_data) > 1:
-                dV_discharge = np.gradient(discharge_data['voltage_V'].values)
-                dQ_discharge = np.gradient(discharge_data['discharge_cap_mAh_g'].values)
-                # Avoid division by zero
-                dvdq = np.abs(np.divide(dV_discharge, dQ_discharge, where=np.abs(dQ_discharge) > 1e-10, out=np.zeros_like(dV_discharge)))
-                for idx, (q, dv) in enumerate(zip(discharge_data['discharge_cap_mAh_g'].values, dvdq)):
-                    result.append({'cycle_number': cycle, 'discharge_cap_mAh_g': q, 'dVdQ': dv})
-        
-        result_df = pd.DataFrame(result)
-        return result_df if not result_df.empty else pd.DataFrame(columns=['cycle_number', 'discharge_cap_mAh_g', 'dVdQ'])
-    
+        """Calculate absolute dV/dQ separately in each discharge CC segment."""
+        return derivative_curves(df, differential_voltage=True)
+
     @staticmethod
     def process_maccor_data(df, p_active_mass):
         """
@@ -439,59 +342,8 @@ class DataProcessor:
                 processed_data['current_mA'] = 0
                 logger.warning("Column 'Echem_Current_A' not found in Maccor data")
             
-            # cycle_number: Echem_Cycle with special handling for initial rest block
-            # Rule: Only the initial contiguous rest block at the beginning becomes cycle_number=0
-            #       Later rest rows after cycling starts stay in their raw Echem_Cycle
-            if 'Echem_Cycle' in df.columns:
-                cycle_series = pd.to_numeric(df['Echem_Cycle'], errors='coerce')
-                
-                if 'Echem_Mode' in df.columns:
-                    mode_series = df['Echem_Mode'].astype(str).str.strip().str.upper()
-                    
-                    # Find first position where mode is C or D (start of cycling)
-                    cd_mask = mode_series.isin(['C', 'CHARGE', 'D', 'DISCHARGE'])
-                    cd_indices = np.where(cd_mask.values)[0]
-                    
-                    if len(cd_indices) > 0:
-                        first_cd_pos = cd_indices[0]
-                        # Initial rest block: rows before first C/D AND mode == R
-                        initial_rest_mask = (np.arange(len(mode_series)) < first_cd_pos) & mode_series.isin(['R', 'REST'])
+            assign_maccor_cycles(processed_data, df, mode_charge_mask, mode_discharge_mask)
 
-                        # For rows after the first C/D, treat raw 0 as missing and forward-fill
-                        fill_series = cycle_series.copy()
-                        after_cd_mask = np.arange(len(fill_series)) >= first_cd_pos
-                        # Replace explicit zeros after first C/D with NaN so ffill can fill from prior cycles
-                        zero_after_cd = after_cd_mask & (fill_series == 0)
-                        if zero_after_cd.any():
-                            fill_series[zero_after_cd] = np.nan
-
-                        # Fill NaN (both original NaNs and zeros we turned to NaN) forward/backward
-                        fill_series = fill_series.ffill().bfill()
-
-                        # Assign 0 only to initial rest rows (before first C/D)
-                        fill_series[initial_rest_mask] = 0
-
-                        cycle_series = fill_series
-
-                        logger.debug(f"Assigned initial {initial_rest_mask.sum()} rest rows (before first C/D) to cycle_number=0; filled zeros after first C/D where possible")
-                    else:
-                        # No C/D rows found; all R rows would be initial rest
-                        rest_mask = mode_series.isin(['R', 'REST'])
-                        cycle_series = cycle_series.ffill().bfill()
-                        cycle_series[rest_mask] = 0
-                        logger.debug("No C/D rows found; all R rows assigned to cycle_number=0")
-                    
-                    # Fill any remaining NaN with 1 (shouldn't happen in well-formed data)
-                    cycle_series = cycle_series.fillna(1)
-                else:
-                    # No mode column, use raw cycle numbers
-                    cycle_series = cycle_series.ffill().bfill().fillna(1)
-                
-                processed_data['cycle_number'] = cycle_series.astype(int)
-            else:
-                processed_data['cycle_number'] = 1
-                logger.warning("Column 'Echem_Cycle' not found in Maccor data")
-            
             # Specific capacity: Convert Ah to mAh/g
             # charge_cap_mAh_g: Capacity for charge cycles (positive current)
             # discharge_cap_mAh_g: Capacity for discharge cycles (negative current)
@@ -568,38 +420,13 @@ class DataProcessor:
                 processed_data['(Q-Qo)_mAh_g'] = processed_data['charge_cap_mAh_g'] - processed_data['discharge_cap_mAh_g']
                 logger.debug("Used fallback charge-discharge difference for (Q-Qo)_mAh_g")
             
-            # Accu_Energy_Wh: accumulated discharge energy only
-            processed_data['Accu_Energy_Wh'] = 0.0
-            if 'Echem_Energy_Wh' in df.columns:
-                energy_series = pd.to_numeric(df['Echem_Energy_Wh'], errors='coerce').fillna(0.0).abs()
-
-                if 'Echem_Mode' in df.columns:
-                    # OPTIMIZATION: Replaced row-by-row loop with vectorized cumsum
-                    # Performance: ~10-15x faster. Numerically identical: mask discharge rows, cumsum, verify with np.allclose
-                    # OPTIMIZATION: Use pre-computed mask to avoid .isin() call
-                    discharge_mask = mode_discharge_mask
-                    discharge_energies = energy_series.copy()
-                    discharge_energies[~discharge_mask] = 0.0
-                    processed_data['Accu_Energy_Wh'] = discharge_energies.cumsum().values
-                    logger.debug("Accumulated discharge energy using mode information (vectorized)")
-                else:
-                    # Fallback: accumulate rows with negative current only
-                    # OPTIMIZATION: Vectorized cumsum instead of loop
-                    current_series = np.nan_to_num(np.asarray(processed_data['current_mA'], dtype=float), nan=0.0)
-                    discharge_mask = current_series < 0
-                    discharge_energies = energy_series.copy()
-                    discharge_energies[~discharge_mask] = 0.0
-                    processed_data['Accu_Energy_Wh'] = discharge_energies.cumsum().values
-                    logger.debug("Accumulated discharge energy using current sign (vectorized)")
-            else:
-                logger.warning("Column 'Echem_Energy_Wh' not found in Maccor data")
-            
             # Reorder columns to match standard format
             column_order = ['time_h', 'cycle_number', 'current_mA', 'voltage_V', 
                            'charge_cap_mAh_g', 'discharge_cap_mAh_g', 
                            '(Q-Qo)_mAh_g', 'Accu_Energy_Wh']
-            processed_data = processed_data[column_order]
-            
+            processed_data["Accu_Energy_Wh"] = cumulative_discharge_energy(processed_data)
+            processed_data["cc_segment"], processed_data["cc_recorded"] = classify_cc(processed_data, df, "Maccor")
+            processed_data = processed_data[column_order + ["cc_segment", "cc_recorded"]]
             logger.info(f"Successfully processed Maccor data: {len(processed_data)} rows, {len(processed_data['cycle_number'].unique())} cycles")
             return processed_data
         except Exception as e:

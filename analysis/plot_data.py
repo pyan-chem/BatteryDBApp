@@ -26,18 +26,18 @@ PLOTS = {
         (("charge_cap_mAh_g", "Charge"), ("discharge_cap_mAh_g", "Discharge")),
         ("cycle_number", "charge_cap_mAh_g", "discharge_cap_mAh_g"), DataProcessor.cycling_vs_capacity,
     ),
-    "Cycling vs. Accumulated Energy": PlotDefinition(
-        "cycle_number", "Cycle number", "Accumulated energy (Wh)", (("Accu_Energy_Wh", "Energy"),),
+    "Cycling vs. Cumulative Discharge Energy": PlotDefinition(
+        "cycle_number", "Cycle number", "Cumulative discharge energy (Wh)", (("Accu_Energy_Wh", "Discharge energy"),),
         ("cycle_number", "Accu_Energy_Wh"), DataProcessor.cycling_vs_accumulated_energy,
     ),
     "dQ/dV": PlotDefinition(
         "voltage_V", "Voltage (V)", "dQ/dV (mAh/g/V)",
         (("dQdV_charge", "Charge"), ("dQdV_discharge", "Discharge")),
-        ("voltage_V", "dQdV_charge", "dQdV_discharge"), per_cycle=True,
+        ("voltage_V", "dQdV_charge", "dQdV_discharge", "segment", "cc_source"), per_cycle=True,
     ),
     "dV/dQ": PlotDefinition(
         "discharge_cap_mAh_g", "Discharge capacity (mAh/g)", "dV/dQ (V g/mAh)",
-        (("dVdQ", "Discharge"),), ("cycle_number", "discharge_cap_mAh_g", "dVdQ"),
+        (("dVdQ", "Discharge"),), ("cycle_number", "discharge_cap_mAh_g", "dVdQ", "segment", "cc_source"),
         DataProcessor.dvdq, per_cycle=True,
     ),
     "Voltage vs. Capacity cyclic": PlotDefinition(
@@ -45,8 +45,8 @@ PLOTS = {
         ("cycle_number", "voltage_V", "(Q-Qo)_mAh_g"), DataProcessor.voltage_vs_capacity_cyclic,
         per_cycle=True,
     ),
-    "Cycling vs. Overvoltage": PlotDefinition(
-        "cycle_number", "Cycle number", "Overvoltage (V)", (("Overvoltage", "Overvoltage"),),
+    "Cycling vs. Average Voltage Gap": PlotDefinition(
+        "cycle_number", "Cycle number", "Average charge − discharge voltage (V)", (("Overvoltage", "Average voltage gap"),),
         ("cycle_number", "Overvoltage"), DataProcessor.cycling_vs_overvoltage,
     ),
     "Cycling vs. Endpointslippage": PlotDefinition(
@@ -66,6 +66,8 @@ def analyze_plot(sample, cycles, analysis_type, definition, *, interpolation_poi
             selected, interpolate_flag=interpolation_points is not None,
             interp_points=interpolation_points if interpolation_points is not None else 1000,
         )
+    if analysis_type == "dV/dQ":
+        return DataProcessor.dvdq(selected)
     if definition.processor:
         # Endpoint slippage needs the history of all preceding cycles.
         data = definition.processor(sample)

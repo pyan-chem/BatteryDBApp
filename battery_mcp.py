@@ -26,8 +26,8 @@ Plot = Literal[
 ]
 PLOT_NAMES: dict[Plot, str] = {
     "capacity": "Cycling vs. Capacity",
-    "overvoltage": "Cycling vs. Overvoltage",
-    "accumulated_energy": "Cycling vs. Accumulated Energy",
+    "overvoltage": "Cycling vs. Average Voltage Gap",
+    "accumulated_energy": "Cycling vs. Cumulative Discharge Energy",
     "endpoint_slippage": "Cycling vs. Endpointslippage",
     "voltage_time": "Voltage vs. Time",
     "voltage_capacity": "Voltage vs. Capacity cyclic",
@@ -180,9 +180,15 @@ def create_server(database_path: Path, data_root: Path | None = None) -> FastMCP
 
     @server.tool(annotations=READ_ONLY)
     def get_available_cycles(battery_id: str) -> Row:
-        """List cycle numbers in the processed measurements. Cycle 0 is the initial rest, when present."""
+        """List cycles and available completion metadata. Cycle 0 is the initial rest, when present."""
         sample = measurements(battery_id)
-        return {"battery_id": battery_id, "cycles": sorted(int(c) for c in sample["cycle_number"].dropna().unique())}
+        cycle_meta = {name: sample.attrs[name] for name in
+                      ("cycle_number_source", "last_cycle_number", "last_cycle_status") if name in sample.attrs}
+        return {
+            "battery_id": battery_id,
+            "cycles": sorted(int(c) for c in sample["cycle_number"].dropna().unique()),
+            **cycle_meta,
+        }
 
     @server.tool(annotations=READ_ONLY)
     def get_measurements(
@@ -216,14 +222,20 @@ def create_server(database_path: Path, data_root: Path | None = None) -> FastMCP
         """Read graph points or per-cycle metrics using BatteryDBApp's plot calculations.
 
         Pass explicit cycles or an inclusive range. Cycle 0 is excluded by default.
+        Derivative plots use CC only and report cc_source (recorded or inferred).
+        accumulated_energy is cumulative discharge energy in Wh.
+        overvoltage is the capacity-weighted charge–discharge voltage gap in V.
         Supply interpolation_points only for dqdv to enable the app's interpolation.
         """
         if interpolation_points is not None and plot != "dqdv":
             raise ValueError("Interpolation is only available for dqdv.")
         sample = measurements(battery_id)
         selected = select_cycles(sample, cycles, cycle_start, cycle_end, default_start=1)
-        if interpolation_points is not None and interpolation_points * len(selected) > INTERPOLATION_BUDGET:
-            raise ValueError("Select fewer cycles or reduce interpolation_points (100,000 per request across cycles).")
+        if interpolation_points is not None:
+            segments = sample.loc[sample["cycle_number"].isin(selected), "cc_segment"]
+            segment_count = segments[segments >= 0].nunique()
+            if interpolation_points * max(segment_count, len(selected)) > INTERPOLATION_BUDGET:
+                raise ValueError("Select fewer cycles or reduce interpolation_points (100,000 per request).")
         name = PLOT_NAMES[plot]
         definition = PLOTS[name]
         frame = analyze_plot(sample, selected, name, definition, interpolation_points=interpolation_points)
