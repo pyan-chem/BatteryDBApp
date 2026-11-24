@@ -84,6 +84,8 @@ The check reads file metadata once per distinct path. Its cost depends mainly on
 | Arbin | `.res` | galvani with mdbtools or a pyodbc fallback with a Microsoft Access ODBC driver |
 | Maccor | `.txt`, `.xyz`, or a numeric extension such as `.001` | Tab-separated text |
 
+Maccor imports detect headers automatically and use fewer columns for faster analysis when the export supports it.
+
 ## Development
 
 - `main.py` launches the application. `database.py` manages SQLite records and file status baselines.

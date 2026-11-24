@@ -28,7 +28,10 @@ def load_and_process_cell(file_path, instrument_type, p_active_mass):
         raise ValueError(f"Unknown instrument type: {instrument_type}")
 
     started = time.perf_counter()
-    raw = DataImporter.import_data(file_path, instrument_type)
+    if instrument_type == "Maccor":
+        raw = DataImporter.import_data(file_path, instrument_type, for_analysis=True)
+    else:
+        raw = DataImporter.import_data(file_path, instrument_type)
     imported = time.perf_counter()
     cleaned = clean_data(raw)
     cleaned_at = time.perf_counter()

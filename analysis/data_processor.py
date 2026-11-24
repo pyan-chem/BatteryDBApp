@@ -531,45 +531,38 @@ class DataProcessor:
             # (Q-Qo)_mAh_g: Build cyclic capacity trajectory for Maccor data
             # - Charge segment starts from previous cycle discharge endpoint
             # - Discharge segment starts from current cycle charge endpoint
-            processed_data['(Q-Qo)_mAh_g'] = 0.0
             if 'Echem_Mode' in df.columns:
-                # Sort once globally so the per-cycle loop can preserve time order without re-sorting slices
                 processed_data = processed_data.sort_values(['cycle_number', 'time_h'])
-                previous_discharge_endpoint = 0.0
                 grouped = processed_data.groupby('cycle_number', sort=False)
+                sorted_index = processed_data.index
+                charging = mode_charge_mask.loc[sorted_index].to_numpy()
+                discharging = mode_discharge_mask.loc[sorted_index].to_numpy()
+                charge_values = np.nan_to_num(processed_data['charge_cap_mAh_g'].to_numpy(dtype=float), nan=0.0)
+                discharge_values = np.nan_to_num(processed_data['discharge_cap_mAh_g'].to_numpy(dtype=float), nan=0.0)
+                trajectory = np.zeros(len(processed_data), dtype=float)
 
-                for cycle, cycle_view in grouped:
-
-                    cycle_idx = cycle_view.index
-
-                    # OPTIMIZATION: Use pre-computed masks to avoid .isin() calls within loop
-                    charge_mask_cycle = mode_charge_mask.loc[cycle_idx]
-                    discharge_mask_cycle = mode_discharge_mask.loc[cycle_idx]
-                    charge_idx = cycle_idx[np.asarray(charge_mask_cycle)]
-                    discharge_idx = cycle_idx[np.asarray(discharge_mask_cycle)]
+                # Each cycle still starts from the previous discharge endpoint.
+                # Work by position and write the complete trajectory back once.
+                previous_discharge_endpoint = 0.0
+                for positions in grouped.indices.values():
+                    charge_idx = positions[charging[positions]]
+                    discharge_idx = positions[discharging[positions]]
 
                     charge_endpoint = previous_discharge_endpoint
-
-                    if len(charge_idx) > 0:
-                        charge_vals = np.nan_to_num(
-                            np.asarray(processed_data.loc[charge_idx, 'charge_cap_mAh_g'], dtype=float),
-                            nan=0.0
-                        )
-                        charge_curve = previous_discharge_endpoint + charge_vals
-                        processed_data.loc[charge_idx, '(Q-Qo)_mAh_g'] = charge_curve
+                    if charge_idx.size:
+                        charge_curve = previous_discharge_endpoint + charge_values[charge_idx]
+                        trajectory[charge_idx] = charge_curve
                         charge_endpoint = float(np.max(charge_curve))
 
-                    if len(discharge_idx) > 0:
-                        discharge_vals = np.nan_to_num(
-                            np.asarray(processed_data.loc[discharge_idx, 'discharge_cap_mAh_g'], dtype=float),
-                            nan=0.0
-                        )
-                        discharge_curve = charge_endpoint - discharge_vals
-                        processed_data.loc[discharge_idx, '(Q-Qo)_mAh_g'] = discharge_curve
+                    if discharge_idx.size:
+                        discharge_curve = charge_endpoint - discharge_values[discharge_idx]
+                        trajectory[discharge_idx] = discharge_curve
                         previous_discharge_endpoint = float(discharge_curve[-1])
                     else:
                         previous_discharge_endpoint = charge_endpoint
-                logger.debug(f"Built cyclic trajectory for {grouped.ngroups} cycles")
+
+                processed_data['(Q-Qo)_mAh_g'] = trajectory
+                logger.debug("Built cyclic trajectory for %d cycles", grouped.ngroups)
             else:
                 # Fallback when mode is unavailable
                 processed_data['(Q-Qo)_mAh_g'] = processed_data['charge_cap_mAh_g'] - processed_data['discharge_cap_mAh_g']

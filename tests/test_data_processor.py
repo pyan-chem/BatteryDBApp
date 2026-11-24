@@ -45,3 +45,34 @@ def test_process_maccor_data_basic():
     assert 'current_mA' in processed.columns
     assert processed['current_mA'].iloc[0] > 0
     assert processed['charge_cap_mAh_g'].sum() >= 0
+def test_maccor_trajectory_keeps_cycle_endpoints_and_writes_in_bulk(monkeypatch):
+    frame = pd.DataFrame(
+        {
+            "Echem_Test_Time_h": [0, 2, 1, 4, 3, 3.5, 6, 5, 7, 8],
+            "Echem_Cycle": [1, 1, 1, 1, 1, 1, 2, 2, 3, 4],
+            "Echem_Mode": ["R", "C", "C", "D", "D", "R", "C", "C", "D", "C"],
+            "Echem_Capacity_Ah": [0, .004, .002, .003, .001, None, None, .002, .001, .001],
+            "Echem_Current_A": [0, .001, .001, .001, .001, 0, .001, .001, .001, .001],
+            "Echem_Voltage_V": [3.5] * 10,
+            "Echem_Energy_Wh": [0] * 10,
+        },
+        index=[10, 11, 14, 18, 20, 25, 31, 43, 52, 60],
+    )
+    loc_type = type(frame.loc)
+    original_setitem = loc_type.__setitem__
+    trajectory_writes = []
+
+    def track_trajectory_write(indexer, key, value):
+        if isinstance(key, tuple) and len(key) == 2 and key[1] == "(Q-Qo)_mAh_g":
+            trajectory_writes.append(key[1])
+        return original_setitem(indexer, key, value)
+
+    monkeypatch.setattr(loc_type, "__setitem__", track_trajectory_write)
+    result = DataProcessor.process_maccor_data(frame, p_active_mass=1.0)
+
+    assert result.index.tolist() == [10, 14, 11, 20, 25, 18, 43, 31, 52, 60]
+    assert result["cycle_number"].tolist() == [0, 1, 1, 1, 1, 1, 2, 2, 3, 4]
+    assert result["(Q-Qo)_mAh_g"].tolist() == [0, 2, 4, 3, 0, 1, 3, 1, 2, 3]
+    assert trajectory_writes == []
+
+

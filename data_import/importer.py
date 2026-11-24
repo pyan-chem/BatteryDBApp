@@ -1,3 +1,5 @@
+import csv
+from itertools import islice
 import pandas as pd
 import os
 import sqlite3
@@ -13,14 +15,20 @@ from tempfile import TemporaryDirectory
 logger = logging.getLogger(__name__)
 
 class DataImporter:
+    MACCOR_ANALYSIS_COLUMNS = {
+        "Echem_Rec#", "Echem_Test_Time_h", "Echem_Cycle", "Echem_Capacity_Ah",
+        "Echem_Energy_Wh", "Echem_Current_A", "Echem_Voltage_V", "Echem_Mode",
+    }
+
     @staticmethod
-    def import_data(file_path, instrument_type):
+    def import_data(file_path, instrument_type, *, for_analysis=False):
         """
         Imports data from Biologic (.mpr), Arbin (.res), or Maccor (.txt, .xyz, .001-.999) files.
         
         Args:
             file_path: Path to the data file
             instrument_type: "Arbin", "Biologic", or "Maccor"
+            for_analysis: Allow a verified column subset for Maccor analysis
         
         Returns:
             pandas DataFrame with the data
@@ -47,7 +55,7 @@ class DataImporter:
             if ext not in [".txt", ".xyz"] and not (ext.startswith(".") and ext[1:].isdigit()):
                 logger.error(f"Invalid Maccor file format: {file_path} (expected .txt/.xyz/numeric, got {ext})")
                 raise ValueError(f"Maccor files must be .txt, .xyz, or numeric format (.001, .002, etc.), got {ext}")
-            return DataImporter._read_maccor(file_path)
+            return DataImporter._read_maccor(file_path, for_analysis=for_analysis)
         else:
             logger.error(f"Unknown instrument type: {instrument_type}")
             raise ValueError(f"Unknown instrument type: {instrument_type}")
@@ -195,7 +203,7 @@ class DataImporter:
             raise ImportError("pyodbc library not installed. Please install it with: pip install pyodbc")
 
     @staticmethod
-    def _read_maccor(file_path, encoding='utf-8'):
+    def _read_maccor(file_path, encoding='utf-8', *, for_analysis=False):
         """
         Read Maccor tab-separated files (.txt, .xyz, or numeric extensions like .001, .002).
         
@@ -208,22 +216,6 @@ class DataImporter:
         """
         try:
             logger.info(f"Reading Maccor file: {file_path}")
-            
-            # Read the tab-separated file, skip first row
-            logger.debug("Parsing Maccor tab-separated file")
-            try:
-                # Try default C engine first (faster)
-                df = pd.read_csv(file_path, sep='\t', skiprows=1, encoding=encoding)
-                logger.debug("Parsed with C engine")
-            except Exception as e:
-                # Fallback to python engine if C engine fails
-                logger.warning(f"C engine failed ({type(e).__name__}), falling back to python engine")
-                df = pd.read_csv(file_path, sep='\t', skiprows=1, engine='python', encoding=encoding)
-            logger.debug(f"Initial data shape: {df.shape}")
-            
-            # Add Echem_ prefix to all column names
-            df.columns = ['Echem_' + c.strip() for c in df.columns]
-            logger.debug(f"Prefixed column names with 'Echem_': {len(df.columns)} columns")
             
             # Create column mapping for various Maccor format compatibility
             column_mapping = {
@@ -261,6 +253,31 @@ class DataImporter:
                 'Echem_ES': 'Echem_Status'
             }
             
+            # Some Maccor exports start with the header, while others have a preamble.
+            with open(file_path, encoding=encoding, newline="") as stream:
+                for header_row, line in enumerate(islice(stream, 32)):
+                    fields = next(csv.reader([line], delimiter='\t'), [])
+                    known_columns = {
+                        column_mapping.get('Echem_' + field.lstrip('\ufeff').strip())
+                        for field in fields
+                    }
+                    if len(known_columns - {None, 'Echem_Step_Time_h', 'Echem_Status'}) >= 2:
+                        break
+                else:
+                    raise ValueError("Could not find a Maccor column header in the first 32 lines.")
+
+            options = {"sep": '\t', "skiprows": header_row, "encoding": encoding}
+            df = None
+            if for_analysis:
+                df = DataImporter._read_maccor_analysis(file_path, options, fields, column_mapping)
+            try:
+                if df is None:
+                    df = pd.read_csv(file_path, **options)
+            except Exception as error:
+                logger.warning("C engine failed (%s), falling back to Python engine", type(error).__name__)
+                df = pd.read_csv(file_path, engine='python', **options)
+            df.columns = ['Echem_' + column.strip() for column in df.columns]
+
             # Apply column mapping
             df = df.rename(columns=lambda x: column_mapping.get(x, x))
             logger.debug(f"Applied column mapping, mapped {len([x for x in column_mapping.values() if x in df.columns])} columns")
@@ -309,4 +326,40 @@ class DataImporter:
         except Exception as e:
             logger.error(f"Error reading Maccor file '{file_path}': {str(e)}", exc_info=True)
             raise Exception(f"Error reading Maccor file: {str(e)}")
+
+    @staticmethod
+    def _read_maccor_analysis(file_path, options, fields, column_mapping):
+        """Project columns only when record IDs preserve the full-row cleanup semantics."""
+        names = ['Echem_' + field.lstrip('\ufeff').strip() for field in fields]
+        mapped = [column_mapping.get(name, name) for name in names]
+        required = DataImporter.MACCOR_ANALYSIS_COLUMNS
+        positions = [index for index, name in enumerate(mapped) if name in required]
+        if len(positions) != len(required) or {mapped[index] for index in positions} != required:
+            return None
+
+        # pandas can ignore ragged rows with usecols. Keep the original parser for
+        # ragged or quoted records, including multiline fields.
+        with open(file_path, encoding=options["encoding"], newline="") as stream:
+            before = os.fstat(stream.fileno())
+            records = islice(stream, options["skiprows"] + 1, None)
+            tabs = len(fields) - 1
+            if any((line.count('\t') != tabs or '"' in line or '\x00' in line)
+                   and line.strip() for line in records):
+                return None
+
+        try:
+            frame = pd.read_csv(file_path, usecols=positions, **options)
+        except pd.errors.ParserError:
+            return None
+        after = os.stat(file_path)
+        if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
+            return None
+        selected_names = ['Echem_' + name.strip() for name in frame.columns]
+        selected_mapped = [column_mapping.get(name, name) for name in selected_names]
+        if set(selected_mapped) != required:
+            return None
+        record_ids = frame.iloc[:, selected_mapped.index("Echem_Rec#")]
+        if record_ids.hasnans or not record_ids.is_unique:
+            return None
+        return frame
 
